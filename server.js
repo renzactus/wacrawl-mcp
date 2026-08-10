@@ -180,8 +180,10 @@ const GROUPING = 'GROUP BY m.msg_id, m.chat_jid, m.ts, m.text';
 
 const MSG_COLUMNS =
   `m.msg_id AS message_id, m.chat_jid, m.chat_name, m.sender_name, m.sender_jid,` +
-  ` m.from_me, m.text, m.message_type,` +
-  ` strftime('%Y-%m-%dT%H:%M:%SZ', m.ts, 'unixepoch') AS timestamp`;
+  ` m.from_me, m.text, m.message_type, m.media_title,` +
+  // Hora LOCAL de esta Mac. En UTC los mensajes de la noche caen al día
+  // siguiente y todo se lee corrido.
+  ` strftime('%Y-%m-%d %H:%M', m.ts, 'unixepoch', 'localtime') AS timestamp`;
 
 async function countDistinct(from, clause) {
   const [row] = await runSQL(`SELECT count(*) AS n FROM (SELECT 1 FROM ${from} WHERE ${clause} ${GROUPING})`);
@@ -246,8 +248,13 @@ async function resolveChatJID(chat) {
  * No hay de dónde recuperar la identidad (contacts.lid no matchea), así que lo
  * decimos explícitamente en vez de mostrar el blob como si fuera un nombre.
  */
-// El "=" de padding al final es la señal fuerte; ningún nombre real termina así.
-const looksLikeBlob = (name) => /^[A-Za-z0-9+/]{2,}={1,2}$/.test(String(name).trim());
+// Dos formas en que se filtran identificadores internos como si fueran texto:
+// base64 con "=" de padding (nombres de remitente, hashes de media) y hex largo
+// en mayúsculas (las reacciones). Ningún mensaje real se ve así.
+const looksLikeBlob = (value) => {
+  const v = String(value).trim();
+  return /^[A-Za-z0-9+/]{2,}={1,2}$/.test(v) || /^[0-9A-F]{16,}$/.test(v);
+};
 
 function senderLabel(m) {
   if (m.from_me) return 'Yo';
@@ -263,12 +270,34 @@ function senderLabel(m) {
   return m.sender_jid ? `(no identificado · ${m.sender_jid})` : '(remitente no identificado)';
 }
 
+/** Etiqueta legible por tipo, para lo que no es texto. */
+const TIPOS = {
+  audio: 'audio', sticker: 'sticker', image: 'imagen', video: 'video',
+  document: 'documento', location: 'ubicación', contact: 'contacto',
+  reaction: 'reacción', system: 'mensaje de sistema', group_event: 'evento de grupo',
+};
+
+/**
+ * OJO: en audios, stickers e imágenes wacrawl mete el HASH del archivo en el
+ * campo `text`. Mostrarlo tal cual hacía que un audio y un sticker se vieran
+ * exactamente igual — un blob base64 indistinguible. Si el texto es un blob,
+ * mandamos el tipo.
+ */
+function messageBody(m) {
+  const texto = m.text ? String(m.text).trim() : '';
+  if (texto && !looksLikeBlob(texto)) return texto;
+
+  const tipo = TIPOS[m.message_type] || m.message_type || 'sin texto';
+  const titulo = m.media_title && !looksLikeBlob(m.media_title) ? `: ${m.media_title}` : '';
+  return `(${tipo}${titulo})`;
+}
+
 function formatMessages(rows, { withChat }) {
   if (rows.length === 0) return 'Sin resultados.';
   return rows
     .map((m) => {
       const where = withChat ? ` [${m.chat_name || m.chat_jid}]` : '';
-      const body = m.text && m.text.trim() ? m.text.trim() : `(${m.message_type || 'sin texto'})`;
+      const body = messageBody(m);
       return `${m.timestamp || '?'}${where} ${senderLabel(m)}: ${body}`;
     })
     .join('\n');
@@ -515,7 +544,7 @@ const handlers = {
     if (solo_recibidos) where.push('m.ZISFROMME = 0');
 
     const rows = await runLiveSQL(
-      `SELECT strftime('%Y-%m-%dT%H:%M:%SZ', m.ZMESSAGEDATE + ${APPLE_EPOCH}, 'unixepoch') AS timestamp,` +
+      `SELECT strftime('%Y-%m-%d %H:%M', m.ZMESSAGEDATE + ${APPLE_EPOCH}, 'unixepoch', 'localtime') AS timestamp,` +
       ` cs.ZPARTNERNAME AS chat_name, m.ZISFROMME AS from_me,` +
       ` gm.ZCONTACTNAME AS member_name, gm.ZMEMBERJID AS member_jid,` +
       ` m.ZPUSHNAME AS push_name, m.ZFROMJID AS sender_jid, m.ZTEXT AS text` +
@@ -540,7 +569,8 @@ const handlers = {
       else if (m.member_jid) quien = `(no identificado · ${m.member_jid})`;
       else if (m.push_name && !looksLikeBlob(m.push_name)) quien = m.push_name;
       else quien = donde;
-      return `${cuando} [${donde}] ${quien}: ${String(m.text).trim()}`;
+      const texto = String(m.text).trim();
+      return `${cuando} [${donde}] ${quien}: ${looksLikeBlob(texto) ? '(archivo adjunto)' : texto}`;
     });
 
     return (
@@ -592,6 +622,12 @@ async function handleRequest(req) {
     default:
       throw Object.assign(new Error(`Método no soportado: ${req.method}`), { code: -32601 });
   }
+}
+
+// Importable desde check.sh para probar el renderizado sin levantar el server.
+if (require.main !== module) {
+  module.exports = { messageBody, senderLabel, formatMessages, looksLikeBlob, TIPOS };
+  return;
 }
 
 let buffer = '';
