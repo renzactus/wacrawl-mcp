@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.wacrawl.sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/renzactus/.local/bin/wacrawl</string>
+        <string>sync</string>
+    </array>
+
+    <!-- cada 6 horas -->
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/renzactus/.wacrawl/sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/renzactus/.wacrawl/sync.err.log</string>
+</dict>
+</plist>

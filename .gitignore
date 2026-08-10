@@ -1,0 +1,19 @@
+# Nunca versionar datos de WhatsApp ni nada derivado del archivo.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Logs y backups de config
+*.log
+*.bak
+*.bak.*
+claude_desktop_config.json
+
+.DS_Store
+node_modules/
+
+# Backup de un skill personal que apareció en esta carpeta; no es parte del server.
+skill-backup/

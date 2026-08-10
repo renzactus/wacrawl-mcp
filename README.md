@@ -1,0 +1,100 @@
+# wacrawl-mcp
+
+MCP server (stdio) que le da a Claude Desktop acceso de **sólo lectura** al WhatsApp local de esta Mac.
+
+Todo local: sin dependencias npm, sin red, sin nube. Nunca escribe, mueve ni borra ninguna base.
+
+## Las dos fuentes
+
+La decisión de diseño central: hay **dos** bases, y cada tool sabe de cuál lee.
+
+| | Archivo (wacrawl) | En vivo (WhatsApp) |
+|---|---|---|
+| Qué es | `~/.wacrawl/wacrawl.db` | `ChatStorage.sqlite` de WhatsApp Desktop |
+| Frescura | hasta 6h atrás | **segundos** |
+| Búsqueda | full-text (FTS5) + subcadena | sólo últimos N mensajes |
+| Profundidad | ~935k mensajes | lo que tenga la app |
+| Velocidad | 1-3 s | 0,05 s |
+
+**Por qué no una sola tool "inteligente" que elija:** conviene saber cuál contestó. Si el esquema
+CoreData de WhatsApp cambia en una actualización de Meta, se rompe sólo la tool en vivo y el
+histórico sigue intacto.
+
+## Tools
+
+| Tool | Fuente | Para qué |
+|---|---|---|
+| `buscar_whatsapp` | archivo | búsqueda full-text, rápida. La opción por defecto |
+| `busqueda_profunda` | archivo | barrido por subcadena, encuentra dentro de palabras. Más lenta, más completa |
+| `listar_chats` | archivo | chats por actividad reciente o por volumen, con no leídos |
+| `leer_chat` | archivo | un hilo en orden cronológico |
+| `mensajes_recientes` | **en vivo** | "¿me contestó?", lo de hace segundos |
+
+Las tools del archivo avisan solas cuando quedó atrás, comparando contra WhatsApp en vivo
+(`wacrawl doctor`, ~1 s):
+
+> ⚠️ El archivo está 2 h atrás de WhatsApp: hay mensajes más nuevos que todavía no entraron.
+
+## Instalación
+
+```bash
+# 1. wacrawl (la fórmula sólo extrae un binario; no compila)
+brew install openclaw/tap/wacrawl
+wacrawl doctor && wacrawl sync
+
+# 2. el agente de sync cada 6h
+./install.sh
+
+# 3. registrar el server en Claude Desktop (con la app CERRADA)
+./register.sh
+```
+
+> **`register.sh` exige que Claude Desktop esté cerrado, y no es capricho.** La app lee
+> `claude_desktop_config.json` al arrancar y **lo reescribe desde memoria al salir**: si se edita con
+> la app abierta, el ⌘Q borra la entrada. Cerrar → editar → abrir.
+
+Si `brew install` falla con *"Command Line Tools are too outdated"*, la fórmula igual sólo hace
+`bin.install` de un tarball de release: bajalo de la URL que declara, verificá su `sha256` e
+instalalo en `~/.local/bin`.
+
+## Limitaciones reales (medidas, no estimadas)
+
+1. **El histórico es de ~19 meses, no de 10 años.** El 99,93% del archivo es 2025-2026; antes de
+   2025 hay 625 registros y prácticamente sin texto. WhatsApp Desktop no guarda esa historia local.
+2. **Ventana ciega de hasta 6h en las tools del archivo.** El sync tarda ~5,4 min aunque entren 181
+   mensajes (`import` no tiene incremental: re-mergea los 935k). No entra en un tool call — Claude
+   Desktop corta a los 4 min. Para eso está `mensajes_recientes`.
+3. **En grupos, ~103k mensajes no tienen remitente identificable.** No es un bug de acá: WhatsApp
+   guarda el nombre vacío y un `@lid` opaco, y esos remitentes no están en la agenda. Verificado
+   contra la base viva. Se muestra el `@lid`, que al menos es estable por persona. **Los DMs no
+   están afectados.**
+4. **Audios e imágenes no tienen transcripción**, sólo metadata.
+5. Los conteos son exactos (se cuentan sobre el total), pero cualquier síntesis de un período largo
+   sale de una muestra acotada por `limit`.
+
+## Notas de implementación
+
+Cosas que cuesta caro volver a descubrir:
+
+- **Nunca usar los subcomandos `chats` / `messages` / `search` de wacrawl.** Hacen un "backfill" que
+  escribe y tarda **minutos** (medido: `chats --limit 2000` colgado 2m40s). Todo va por `wacrawl sql`,
+  que es sólo lectura y tarda 1-3 s. Este fue el bug de los timeouts.
+- **`wacrawl search` está roto de cobertura**, no el índice: por FTS via SQL, "error" en un grupo da
+  69 resultados; el subcomando daba 1.
+- **La tabla `messages` guarda cada conversación repetida** (mismo `msg_id`, distinto `source_pk`).
+  Hay que agrupar por `msg_id, chat_jid, ts, text` **antes** del LIMIT, o los conteos salen ~3x
+  inflados y el limit devuelve de menos.
+- **`chats.last_message_at` tiene filas corruptas** (año 9026) que encabezarían cualquier orden por
+  fecha. Se ordena por `max(ts)` de los mensajes reales.
+- **Las llamadas al CLI van serializadas.** Dos en paralelo dan `SQLITE_BUSY` porque el auto-sync
+  escribe. Hay reintento con backoff por si el agente de launchd está corriendo.
+- **La base viva se abre con `mode=ro` + `-readonly`.** Nunca se escribe ni se crea WAL.
+- Claude Desktop no hereda el PATH del shell: todas las rutas en la config son absolutas.
+
+## Verificar que anda
+
+```bash
+launchctl print gui/$(id -u)/com.openclaw.wacrawl.sync | grep -E "state|last exit"
+tail ~/.wacrawl/sync.log
+grep -i wacrawl ~/Library/Logs/Claude/mcp.log | tail -20
+```
