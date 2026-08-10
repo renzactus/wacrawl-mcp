@@ -262,7 +262,9 @@ function senderLabel(m) {
   if (name && !looksLikeBlob(name)) return name;
 
   // En un DM el remitente es, por definición, la contraparte del chat: aunque
-  // el nombre venga como blob, sabemos perfectamente quién es.
+  // el nombre venga como blob, sabemos perfectamente quién es. Lo mismo vale
+  // para un estado: lo publicó el dueño del chat.
+  if (esEstado(m)) return m.chat_name || 'alguien';
   if (m.sender_jid && m.sender_jid === m.chat_jid) return m.chat_name || m.sender_jid;
 
   // En grupos sólo queda el @lid opaco. Lo mostramos igual porque es estable
@@ -292,13 +294,21 @@ function messageBody(m) {
   return `(${tipo}${titulo})`;
 }
 
+/**
+ * Los estados (las historias de 24h) vienen mezclados con los mensajes y se ven
+ * igual que un DM, aunque no te los mandaron a vos: se publican para todos los
+ * contactos. WhatsApp los marca con la dirección reservada `status@broadcast`,
+ * así que no hay que adivinar nada — sólo mostrarlo.
+ */
+const esEstado = (m) => String(m.sender_jid || '').includes('status@broadcast');
+
 function formatMessages(rows, { withChat }) {
   if (rows.length === 0) return 'Sin resultados.';
   return rows
     .map((m) => {
       const where = withChat ? ` [${m.chat_name || m.chat_jid}]` : '';
-      const body = messageBody(m);
-      return `${m.timestamp || '?'}${where} ${senderLabel(m)}: ${body}`;
+      const marca = esEstado(m) ? ' [estado]' : '';
+      return `${m.timestamp || '?'}${where}${marca} ${senderLabel(m)}: ${messageBody(m)}`;
     })
     .join('\n');
 }
@@ -496,7 +506,7 @@ const handlers = {
     if (shown.length === 0) return `Sin chats${filtro ? ` que coincidan con "${filtro}"` : ''}.`;
 
     const lines = shown.map((c) => {
-      const kind = c.kind === 'group' ? 'grupo' : 'dm';
+      const kind = { group: 'grupo', dm: 'dm', status: 'estados', newsletter: 'canal' }[c.kind] || c.kind;
       const unread = c.unread_count ? `, ${c.unread_count} sin leer` : '';
       const last = c.last_message_at ? `último ${c.last_message_at}` : 'sin mensajes';
       return `• ${c.name || '(sin nombre)'} — ${kind} — ${last} — ${c.message_count} mensajes${unread} — ${c.jid}`;
