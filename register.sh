@@ -22,16 +22,25 @@ fi
 
 cp "$CFG" "$CFG.bak.$(date +%Y%m%d%H%M%S)"
 
-python3 - "$CFG" <<'PY'
+# La ruta sale de dónde está este script, no hardcodeada: así mover el repo no
+# vuelve a desincronizar la config de Claude Desktop.
+SERVER="$(cd "$(dirname "$0")" && pwd)/server.js"
+[ -f "$SERVER" ] || { echo "✗ No encuentro $SERVER"; exit 1; }
+
+NODE="$(command -v node || true)"
+[ -x "$NODE" ] || NODE=/opt/homebrew/bin/node
+[ -x "$NODE" ] || { echo "✗ No encuentro node"; exit 1; }
+
+python3 - "$CFG" "$SERVER" "$NODE" <<'PY'
 import json, sys
 
-path = sys.argv[1]
+path, server, node = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(path) as f:
     cfg = json.load(f)
 
 cfg.setdefault("mcpServers", {})["wacrawl"] = {
-    "command": "/opt/homebrew/bin/node",
-    "args": ["/Users/renzactus/mcp/wacrawl-mcp/server.js"],
+    "command": node,
+    "args": [server],
     "env": {"WACRAWL_BIN": "/Users/renzactus/.local/bin/wacrawl"},
 }
 
