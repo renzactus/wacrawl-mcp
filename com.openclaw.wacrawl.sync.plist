@@ -5,10 +5,12 @@
     <key>Label</key>
     <string>com.openclaw.wacrawl.sync</string>
 
+    <!-- Llama al wrapper, no a wacrawl directo: el wrapper detecta el error de
+         "different event", se auto-recupera con backup, y avisa si algo falla.
+         Sin él, un sync roto pasa desapercibido durante días. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/renzactus/.local/bin/wacrawl</string>
-        <string>sync</string>
+        <string>/Users/renzactus/workspace/wacrawl-mcp/sync-wrapper.sh</string>
     </array>
 
     <!-- cada 6 horas -->

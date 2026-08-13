@@ -96,6 +96,26 @@ print(f\"  atraso:    {int((viv - arch['t']) / 60)} min\")
   echo
 fi
 
+# ------------------------------------------------------------------ sync
+# El sync estuvo roto 4 días sin que nadie se enterara. Esto lo hace visible.
+if [ "$SOLO" = todo ] || [ "$SOLO" = sync ]; then
+  echo "══ Salud del sync ══"
+  LABEL=com.openclaw.wacrawl.sync
+  EXIT=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -m1 "last exit code" | tr -d ' \t')
+  echo "  agente:        ${EXIT:-NO INSTALADO}"
+  if [ -f "$HOME/.wacrawl/wrapper.log" ]; then
+    echo "  última corrida:"
+    tail -4 "$HOME/.wacrawl/wrapper.log" | sed 's/^/    /'
+  else
+    echo "  ⚠️  sin wrapper.log — el agente no está usando sync-wrapper.sh"
+  fi
+  if [ -s "$HOME/.wacrawl/sync.err.log" ]; then
+    echo "  ⚠️  hay errores en sync.err.log:"
+    tail -2 "$HOME/.wacrawl/sync.err.log" | sed 's/^/    /'
+  fi
+  echo
+fi
+
 # ------------------------------------------------------------- atribución
 if [ "$SOLO" = todo ] || [ "$SOLO" = atribucion ]; then
   echo "══ Atribución de remitente ══"
