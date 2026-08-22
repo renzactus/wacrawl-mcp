@@ -42,7 +42,10 @@ data_age_hours() {
 
 log "--- inicio ---"
 
-OUT=$("$WACRAWL" sync 2>&1); RC=$?
+# --copy-media: copia los adjuntos a ~/.wacrawl/media, FUERA del container
+# protegido de WhatsApp. Así el MCP los lee sin depender de permisos de macOS,
+# y siguen andando aunque el permiso de node se pierda por un update.
+OUT=$("$WACRAWL" import --copy-media 2>&1); RC=$?
 
 if [ $RC -ne 0 ]; then
   log "sync FALLO (rc=$RC): $OUT"
@@ -63,7 +66,7 @@ if [ $RC -ne 0 ]; then
       "SELECT count(*) AS n FROM messages" 2>/dev/null \
       | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['n'])" 2>/dev/null || echo 0)
 
-    if OUT2=$("$WACRAWL" import --restore 2>&1); then
+    if OUT2=$("$WACRAWL" import --restore --copy-media 2>&1); then
       DESPUES=$("$WACRAWL" --sync never --json sql \
         "SELECT count(*) AS n FROM messages" 2>/dev/null \
         | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['n'])" 2>/dev/null || echo 0)

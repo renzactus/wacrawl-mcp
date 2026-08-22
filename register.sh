@@ -27,8 +27,16 @@ cp "$CFG" "$CFG.bak.$(date +%Y%m%d%H%M%S)"
 SERVER="$(cd "$(dirname "$0")" && pwd)/server.js"
 [ -f "$SERVER" ] || { echo "✗ No encuentro $SERVER"; exit 1; }
 
-NODE="$(command -v node || true)"
-[ -x "$NODE" ] || NODE=/opt/homebrew/bin/node
+# Preferimos el runtime dedicado: el permiso de macOS queda acotado a este
+# server en vez de dárselo a todo lo que corra con node. Ver setup-runtime.sh.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$DIR/runtime/bin/node" ]; then
+  NODE="$DIR/runtime/bin/node"
+else
+  NODE="$(command -v node || true)"
+  [ -x "$NODE" ] || NODE=/opt/homebrew/bin/node
+  echo "  (sin runtime dedicado: usando $NODE — corré ./setup-runtime.sh)"
+fi
 [ -x "$NODE" ] || { echo "✗ No encuentro node"; exit 1; }
 
 python3 - "$CFG" "$SERVER" "$NODE" <<'PY'

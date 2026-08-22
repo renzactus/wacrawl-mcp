@@ -17,3 +17,6 @@ node_modules/
 
 # Backup de un skill personal que apareció en esta carpeta; no es parte del server.
 skill-backup/
+
+# Copia dedicada de node (67 MB). Se rearma con ./setup-runtime.sh
+runtime/

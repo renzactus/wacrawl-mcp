@@ -41,14 +41,37 @@ Las tools del archivo avisan solas cuando quedó atrás, comparando contra Whats
 ```bash
 # 1. wacrawl (la fórmula sólo extrae un binario; no compila)
 brew install openclaw/tap/wacrawl
-wacrawl doctor && wacrawl sync
+wacrawl doctor && wacrawl import --copy-media
 
-# 2. el agente de sync cada 6h
+# 2. copia dedicada de node (ver "Permisos de macOS")
+./setup-runtime.sh
+
+# 3. el agente de sync cada 6h
 ./install.sh
 
-# 3. registrar el server en Claude Desktop (con la app CERRADA)
+# 4. registrar el server en Claude Desktop (con la app CERRADA)
 ./register.sh
 ```
+
+## Permisos de macOS
+
+Claude Desktop lanza los MCP servers vía `Contents/Helpers/disclaimer`, que corta la herencia de
+permisos: el proceso responsable ante macOS pasa a ser **node**, no Claude. Por eso aparece
+*"node would like to access data from other apps"* al leer el container de WhatsApp — y por eso
+darle el permiso a Claude no sirve. Tampoco sirve leer vía wacrawl: macOS mira el proceso
+responsable, no el binario que abre el archivo.
+
+Dos defensas, y conviene tener las dos:
+
+1. **`--copy-media` en el sync** deja los adjuntos en `~/.wacrawl/media`, fuera de la zona
+   protegida. `ver_archivos` no necesita ningún permiso. Cuesta ~780 MB duplicados.
+2. **`./setup-runtime.sh`** arma una copia de node en `runtime/`, usada sólo por este server. Se le
+   da Acceso completo al disco a **esa** ruta, así `npx -y mongodb-mcp-server` y cualquier otro
+   script de node NO lo heredan. Además la ruta es estable: el node de Homebrew está firmado
+   ad-hoc, así que cada update le cambia la identidad y el permiso se pierde.
+
+Sólo `mensajes_recientes` (que lee la base viva) depende de ese permiso. Sin él, las otras cuatro
+tools siguen funcionando.
 
 > **`register.sh` exige que Claude Desktop esté cerrado, y no es capricho.** La app lee
 > `claude_desktop_config.json` al arrancar y **lo reescribe desde memoria al salir**: si se edita con
