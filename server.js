@@ -88,8 +88,6 @@ async function runSQL(sql) {
 /* fuente en vivo: la base de WhatsApp Desktop, ESTRICTAMENTE read-only */
 /* ------------------------------------------------------------------ */
 
-const SQLITE_BIN = '/usr/bin/sqlite3';
-
 /** CoreData cuenta segundos desde 2001-01-01, no desde 1970. */
 const APPLE_EPOCH = 978307200;
 
@@ -113,33 +111,28 @@ function sourcePath() {
 }
 
 /**
- * Consulta la base VIVA de WhatsApp. `mode=ro` + `-readonly`: nunca escribe,
- * nunca crea WAL, nunca la mueve. Es la única forma de ver lo de hace segundos:
- * el archivo de wacrawl siempre va atrás porque su sync tarda ~5 min.
+ * Consulta la base VIVA de WhatsApp, a través del propio wacrawl.
+ *
+ * Va por wacrawl y no por /usr/bin/sqlite3 por un motivo concreto: macOS le
+ * pedía permiso a NODE cada vez, porque node era quien abría el container de
+ * WhatsApp. wacrawl ya tiene ese permiso concedido (es el que sincroniza), así
+ * que usándolo el prompt desaparece — y de paso no hace falta darle acceso a
+ * todo el disco a node, que sería mucho más amplio.
+ *
+ * `sql` de wacrawl rechaza todo lo que no sea un único SELECT, y está
+ * verificado que no modifica el archivo de WhatsApp.
  */
 async function runLiveSQL(sql) {
   const db = await sourcePath();
-  const out = await execWacrawlLike(SQLITE_BIN, ['-readonly', '-json', `file:${db}?mode=ro`, sql]);
+  const out = await runWacrawl(['--db', db, '--sync', 'never', '--json', 'sql', sql]);
   const trimmed = out.trim();
   if (!trimmed) return [];
   try {
-    return JSON.parse(trimmed);
+    const parsed = JSON.parse(trimmed);
+    return (Array.isArray(parsed) ? parsed : [parsed]).filter((r) => r && typeof r === 'object');
   } catch {
-    throw new Error(`sqlite3 devolvió una salida inesperada: ${trimmed.slice(0, 300)}`);
+    throw new Error(`wacrawl devolvió una salida inesperada: ${trimmed.slice(0, 300)}`);
   }
-}
-
-function execWacrawlLike(bin, args) {
-  return new Promise((resolve, reject) => {
-    execFile(bin, args, { maxBuffer: MAX_BUFFER, timeout: TIMEOUT_MS }, (err, stdout, stderr) => {
-      if (err) {
-        const detail = (stderr || stdout || err.message).toString().trim();
-        reject(new Error(`${path.basename(bin)} falló: ${detail}`));
-        return;
-      }
-      resolve(stdout.toString());
-    });
-  });
 }
 
 /* ------------------------------------------------------------------ */
