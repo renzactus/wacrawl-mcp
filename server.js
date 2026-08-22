@@ -136,6 +136,43 @@ async function runLiveSQL(sql) {
 }
 
 /* ------------------------------------------------------------------ */
+/* media: convertir a algo que Claude pueda VER                        */
+/* ------------------------------------------------------------------ */
+
+const SIPS_BIN = '/usr/bin/sips';
+const MAX_PX = 1024;
+
+/**
+ * Normaliza cualquier adjunto a JPEG para devolverlo como imagen por MCP.
+ *
+ * Los PDF se RENDERIZAN a imagen en vez de extraerles el texto: macOS no trae
+ * nada nativo para eso (Spotlight no indexa el container de WhatsApp y PyObjC
+ * no está instalado), y renderizar sirve igual para PDFs escaneados, donde no
+ * hay texto que extraer. `sips` viene con el sistema, así que cero dependencias.
+ *
+ * Ojo: de un PDF sale SÓLO la primera página.
+ */
+async function renderToJpeg(srcPath) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wacrawl-media-'));
+  const out = path.join(dir, 'out.jpg');
+  try {
+    await new Promise((resolve, reject) => {
+      execFile(
+        SIPS_BIN,
+        ['-s', 'format', 'jpeg', '-Z', String(MAX_PX), srcPath, '--out', out],
+        { timeout: 30000 },
+        (err, stdout, stderr) => (err ? reject(new Error((stderr || err.message).toString().trim())) : resolve())
+      );
+    });
+    return fs.readFileSync(out).toString('base64');
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* no importa */ }
+  }
+}
+
+const EXT_SOPORTADAS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.heic', '.gif', '.pdf', '.tiff', '.bmp']);
+
+/* ------------------------------------------------------------------ */
 /* SQL helpers                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -173,7 +210,7 @@ const GROUPING = 'GROUP BY m.msg_id, m.chat_jid, m.ts, m.text';
 
 const MSG_COLUMNS =
   `m.msg_id AS message_id, m.chat_jid, m.chat_name, m.sender_name, m.sender_jid,` +
-  ` m.from_me, m.text, m.message_type, m.media_title,` +
+  ` m.from_me, m.text, m.message_type, m.media_title, m.media_path,` +
   // Hora LOCAL de esta Mac. En UTC los mensajes de la noche caen al día
   // siguiente y todo se lee corrido.
   ` strftime('%Y-%m-%d %H:%M', m.ts, 'unixepoch', 'localtime') AS timestamp`;
@@ -449,6 +486,21 @@ const TOOLS = [
     },
   },
   {
+    name: 'ver_archivos',
+    description:
+      'Muestra las imágenes y documentos que se mandaron en un chat, para poder MIRARLOS (no sólo saber que existen). Los PDF se ven como imagen de su primera página. Ojo: WhatsApp Desktop sólo guarda media en esta Mac desde el 2026-08-06; de antes no hay archivos, aunque el mensaje exista.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: { type: 'string', description: 'Opcional: limitar a un chat, por nombre o por JID.' },
+        tipo: { type: 'string', enum: ['imagen', 'documento', 'todos'], description: 'Qué traer. Default: todos.' },
+        desde: { type: 'string', description: 'Opcional: sólo posteriores. YYYY-MM-DD o RFC3339.' },
+        hasta: { type: 'string', description: 'Opcional: sólo anteriores. YYYY-MM-DD o RFC3339.' },
+        limit: { type: 'integer', description: 'Máximo de archivos (default 3, máx 10). Son imágenes: pedí pocas.' },
+      },
+    },
+  },
+  {
     name: 'leer_chat',
     description:
       'Lee los mensajes de un chat en orden cronológico (del más viejo al más nuevo), con remitente y fecha.',
@@ -583,6 +635,65 @@ const handlers = {
     );
   },
 
+  async ver_archivos({ chat, tipo, desde, hasta, limit }) {
+    const max = clampLimit(limit, 3, 10);
+    const tipos = tipo === 'imagen' ? ['image'] : tipo === 'documento' ? ['document'] : ['image', 'document'];
+
+    const where = await commonFilters({ chat, desde, hasta });
+    where.push(`m.media_path IS NOT NULL AND m.media_path <> ''`);
+    where.push(`m.message_type IN (${tipos.map(sqlString).join(', ')})`);
+
+    const rows = await selectMessages('messages m', where.join(' AND '), 'DESC', max * 3);
+
+    const content = [];
+    let mostrados = 0;
+    const problemas = [];
+
+    for (const m of rows) {
+      if (mostrados >= max) break;
+      const ruta = m.media_path;
+      if (!ruta || !fs.existsSync(ruta)) {
+        problemas.push(`${m.timestamp} ${m.chat_name}: el archivo ya no está en disco`);
+        continue;
+      }
+      if (!EXT_SOPORTADAS.has(path.extname(ruta).toLowerCase())) {
+        problemas.push(`${m.timestamp} ${m.chat_name}: ${path.extname(ruta)} no se puede mostrar`);
+        continue;
+      }
+      try {
+        const data = await renderToJpeg(ruta);
+        const que = m.message_type === 'document' ? 'documento (primera página)' : 'imagen';
+        const titulo = m.media_title && !looksLikeBlob(m.media_title) ? ` — ${m.media_title}` : '';
+        content.push({
+          type: 'text',
+          text: `${m.timestamp} [${m.chat_name || m.chat_jid}] ${senderLabel(m)} — ${que}${titulo}`,
+        });
+        content.push({ type: 'image', data, mimeType: 'image/jpeg' });
+        mostrados += 1;
+      } catch (err) {
+        problemas.push(`${m.timestamp} ${m.chat_name}: no se pudo convertir (${err.message.slice(0, 80)})`);
+      }
+    }
+
+    if (mostrados === 0) {
+      const detalle = problemas.length ? `\n\n${problemas.join('\n')}` : '';
+      return (
+        `No hay archivos para mostrar${chat ? ` en "${chat}"` : ''}.` +
+        ` Recordá que WhatsApp Desktop sólo guarda media en esta Mac desde el 2026-08-06;` +
+        ` de mensajes anteriores existe el registro pero no el archivo.${detalle}`
+      );
+    }
+
+    content.unshift({
+      type: 'text',
+      text: `${mostrados} archivo(s)${chat ? ` de "${chat}"` : ''}, del más nuevo al más viejo:`,
+    });
+    if (problemas.length) {
+      content.push({ type: 'text', text: `\nNo se pudieron mostrar:\n${problemas.join('\n')}` });
+    }
+    return content;
+  },
+
   async leer_chat({ chat, desde, hasta, limit }) {
     if (!chat) throw new Error('`chat` es obligatorio.');
     const jid = await resolveChatJID(chat);
@@ -620,7 +731,10 @@ async function handleRequest(req) {
       const { name, arguments: args } = req.params || {};
       const handler = handlers[name];
       if (!handler) throw new Error(`Tool desconocida: ${name}`);
-      return { content: [{ type: 'text', text: await handler(args || {}) }] };
+      // Las tools devuelven texto, o ya un array de contenido MCP cuando
+      // mandan imágenes junto con su contexto.
+      const salida = await handler(args || {});
+      return { content: Array.isArray(salida) ? salida : [{ type: 'text', text: salida }] };
     }
     default:
       throw Object.assign(new Error(`Método no soportado: ${req.method}`), { code: -32601 });
@@ -638,7 +752,13 @@ let pending = 0;
 let stdinEnded = false;
 
 function maybeExit() {
-  if (stdinEnded && pending === 0) process.exit(0);
+  // NO usar process.exit(): trunca lo que quede sin vaciar en stdout, y una
+  // imagen en base64 no entra de una sola pasada. Soltamos stdin y dejamos que
+  // node salga solo cuando ya no tenga nada pendiente.
+  if (stdinEnded && pending === 0) {
+    process.exitCode = 0;
+    process.stdin.pause();
+  }
 }
 
 process.stdin.setEncoding('utf8');

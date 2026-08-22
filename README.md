@@ -29,6 +29,7 @@ histórico sigue intacto.
 | `listar_chats` | archivo | chats por actividad reciente o por volumen, con no leídos |
 | `leer_chat` | archivo | un hilo en orden cronológico |
 | `mensajes_recientes` | **en vivo** | "¿me contestó?", lo de hace segundos |
+| `ver_archivos` | archivo + disco | mirar imágenes y PDFs de verdad, no sólo saber que existen |
 
 Las tools del archivo avisan solas cuando quedó atrás, comparando contra WhatsApp en vivo
 (`wacrawl doctor`, ~1 s):
@@ -68,8 +69,12 @@ instalalo en `~/.local/bin`.
    guarda el nombre vacío y un `@lid` opaco, y esos remitentes no están en la agenda. Verificado
    contra la base viva. Se muestra el `@lid`, que al menos es estable por persona. **Los DMs no
    están afectados.**
-4. **Audios e imágenes no tienen transcripción**, sólo metadata.
-5. Los conteos son exactos (se cuentan sobre el total), pero cualquier síntesis de un período largo
+4. **La media local arranca el 2026-08-06.** Ese día WhatsApp Desktop empezó a
+   descargarla (la política ya estaba en `image/audio/video/document = 1`); de antes
+   no hay un solo archivo en esta Mac, aunque el mensaje figure. De ahí en adelante la
+   cobertura es ~70% y crece sola. Las miniaturas `.thumb` no sirven: son JPEG de 72x72.
+5. **Los audios no se transcriben**: se sabe que existen y cuándo, no qué dicen.
+6. Los conteos son exactos (se cuentan sobre el total), pero cualquier síntesis de un período largo
    sale de una muestra acotada por `limit`.
 
 ## Notas de implementación
@@ -90,6 +95,11 @@ Cosas que cuesta caro volver a descubrir:
   escribe. Hay reintento con backoff por si el agente de launchd está corriendo.
 - **La base viva se abre con `mode=ro` + `-readonly`.** Nunca se escribe ni se crea WAL.
 - Claude Desktop no hereda el PATH del shell: todas las rutas en la config son absolutas.
+- **Los PDF se renderizan a imagen con `sips`, no se les extrae el texto.** macOS no trae nada
+  nativo para extraerlo (Spotlight no indexa el container de WhatsApp, PyObjC no está), y
+  renderizar funciona igual con PDFs escaneados. Sale sólo la primera página.
+- **Nunca `process.exit()` con contenido pendiente en stdout**: trunca la respuesta, y una imagen
+  en base64 no se vacía de una sola pasada.
 
 ## Verificar que anda
 
