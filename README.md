@@ -30,6 +30,7 @@ histórico sigue intacto.
 | `leer_chat` | archivo | un hilo en orden cronológico |
 | `mensajes_recientes` | **en vivo** | "¿me contestó?", lo de hace segundos |
 | `ver_archivos` | archivo + disco | mirar imágenes y PDFs de verdad, no sólo saber que existen |
+| `exportar_archivo` | archivo + disco | sacar un adjunto a ~/Downloads para usarlo: subirlo, adjuntarlo, pasarlo a otra herramienta |
 
 Las tools del archivo avisan solas cuando quedó atrás, comparando contra WhatsApp en vivo
 (`wacrawl doctor`, ~1 s):

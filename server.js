@@ -501,6 +501,27 @@ const TOOLS = [
     },
   },
   {
+    name: 'exportar_archivo',
+    description:
+      'Copia un adjunto de WhatsApp a una carpeta normal (por defecto ~/Downloads) y devuelve la ruta, para poder USARLO: subirlo, adjuntarlo, mandarlo a otra herramienta. Distinto de ver_archivos, que sólo permite mirarlo. Sirve para cualquier tipo de archivo, también los que no se pueden mostrar (videos, audios, planillas).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: { type: 'string', description: 'Opcional: limitar a un chat, por nombre o por JID.' },
+        contiene: { type: 'string', description: 'Opcional: texto que acompaña al archivo, para encontrar uno puntual.' },
+        tipo: {
+          type: 'string',
+          enum: ['imagen', 'documento', 'audio', 'video', 'todos'],
+          description: 'Qué tipo de adjunto. Default: todos.',
+        },
+        desde: { type: 'string', description: 'Opcional: sólo posteriores. YYYY-MM-DD o RFC3339.' },
+        hasta: { type: 'string', description: 'Opcional: sólo anteriores. YYYY-MM-DD o RFC3339.' },
+        destino: { type: 'string', description: 'Carpeta donde copiarlo. Default: ~/Downloads.' },
+        limit: { type: 'integer', description: 'Máximo de archivos a exportar (default 1, máx 20).' },
+      },
+    },
+  },
+  {
     name: 'leer_chat',
     description:
       'Lee los mensajes de un chat en orden cronológico (del más viejo al más nuevo), con remitente y fecha.',
@@ -692,6 +713,79 @@ const handlers = {
       content.push({ type: 'text', text: `\nNo se pudieron mostrar:\n${problemas.join('\n')}` });
     }
     return content;
+  },
+
+  async exportar_archivo({ chat, contiene, tipo, desde, hasta, destino, limit }) {
+    const max = clampLimit(limit, 1, 20);
+    const PORTIPO = {
+      imagen: ['image'], documento: ['document'], audio: ['audio'], video: ['video'],
+    };
+    const tipos = PORTIPO[tipo] || ['image', 'document', 'audio', 'video', 'sticker'];
+
+    const dir = destino
+      ? path.resolve(destino.replace(/^~(?=$|\/)/, os.homedir()))
+      : path.join(os.homedir(), 'Downloads');
+
+    const where = await commonFilters({ chat, desde, hasta });
+    where.push(`m.media_path IS NOT NULL AND m.media_path <> ''`);
+    where.push(`m.message_type IN (${tipos.map(sqlString).join(', ')})`);
+    if (contiene) {
+      where.push(`lower(m.text) LIKE ${sqlString(`%${likeLiteral(String(contiene).toLowerCase())}%`)} ESCAPE '\\'`);
+    }
+
+    const rows = await selectMessages('messages m', where.join(' AND '), 'DESC', max * 3);
+
+    if (!fs.existsSync(dir)) {
+      throw new Error(`La carpeta de destino no existe: ${dir}`);
+    }
+
+    const hechos = [];
+    const fallados = [];
+
+    for (const m of rows) {
+      if (hechos.length >= max) break;
+      if (!m.media_path || !fs.existsSync(m.media_path)) {
+        fallados.push(`${m.timestamp} ${m.chat_name}: el archivo no está en disco`);
+        continue;
+      }
+      // Nombre legible: el archivo original es un UUID, y media_title no sirve
+      // (a veces trae el texto del mensaje, a veces un blob base64).
+      const limpio = (s) => String(s || '').replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+      const base = [
+        (m.timestamp || '').replace(/[: ]/g, '-'),
+        limpio(m.chat_name),
+        limpio(senderLabel(m)),
+      ].filter(Boolean).join('_');
+
+      const ext = path.extname(m.media_path);
+      let salida = path.join(dir, `${base}${ext}`);
+      for (let i = 2; fs.existsSync(salida); i += 1) salida = path.join(dir, `${base}-${i}${ext}`);
+
+      try {
+        fs.copyFileSync(m.media_path, salida);
+        const kb = Math.round(fs.statSync(salida).size / 1024);
+        const contexto = m.text && !looksLikeBlob(m.text) ? `\n   "${String(m.text).trim().slice(0, 120)}"` : '';
+        hechos.push(
+          `• ${salida}\n   ${kb} KB — ${m.timestamp} en "${m.chat_name}", de ${senderLabel(m)}${contexto}`
+        );
+      } catch (err) {
+        fallados.push(`${m.timestamp} ${m.chat_name}: ${err.message.slice(0, 80)}`);
+      }
+    }
+
+    if (hechos.length === 0) {
+      return (
+        `No encontré ningún archivo para exportar${chat ? ` en "${chat}"` : ''}` +
+        `${contiene ? ` que mencione "${contiene}"` : ''}.` +
+        ` Recordá que sólo hay archivos desde el 2026-08-06.` +
+        (fallados.length ? `\n\n${fallados.join('\n')}` : '')
+      );
+    }
+
+    return (
+      `${hechos.length} archivo(s) copiado(s) a ${dir}:\n\n${hechos.join('\n')}` +
+      (fallados.length ? `\n\nNo se pudieron copiar:\n${fallados.join('\n')}` : '')
+    );
   },
 
   async leer_chat({ chat, desde, hasta, limit }) {
