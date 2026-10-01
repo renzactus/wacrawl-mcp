@@ -31,11 +31,31 @@ histórico sigue intacto.
 | `mensajes_recientes` | **en vivo** | "¿me contestó?", lo de hace segundos |
 | `ver_archivos` | archivo + disco | mirar imágenes y PDFs de verdad, no sólo saber que existen |
 | `exportar_archivo` | archivo + disco | sacar un adjunto a ~/Downloads para usarlo: subirlo, adjuntarlo, pasarlo a otra herramienta |
+| `preparar_mensaje` | abre WhatsApp | deja un mensaje **escrito pero sin enviar** en un chat; lo manda la persona con Enter |
 
 Las tools del archivo avisan solas cuando quedó atrás, comparando contra WhatsApp en vivo
 (`wacrawl doctor`, ~1 s):
 
 > ⚠️ El archivo está 2 h atrás de WhatsApp: hay mensajes más nuevos que todavía no entraron.
+
+## Borradores, no envíos
+
+`preparar_mensaje` **no envía nada**: abre WhatsApp Desktop vía `whatsapp://send` con el texto en la
+caja, y la persona aprieta Enter. Lo manda la app oficial, así que no hay riesgo de ban por cliente
+no oficial. Verificado contra la base viva: el conteo de mensajes del chat no cambia al abrir un
+borrador.
+
+Las barreras están en código, no en el prompt (un modelo desbocado ignora instrucciones, no un `if`),
+y los contadores se persisten en `~/.wacrawl/borradores.jsonl` para que reiniciar no los resetee:
+
+- máximo 3 borradores por minuto y 15 por hora
+- **anti-difusión**: el mismo texto (ignorando mayúsculas y espacios) a otro chat en la última hora → bloqueado
+- sólo chats individuales: WhatsApp no permite abrir grupos por enlace
+- aviso si el número nunca tuvo conversación
+- interruptor de emergencia: `touch ~/.wacrawl/STOP` desactiva todo; borrarlo lo reactiva
+
+Limitación: hace falta el número de teléfono. Los chats `@lid` se resuelven por la agenda; los de
+gente no agendada (~250) no tienen número visible — WhatsApp lo oculta a propósito.
 
 ## Instalación
 

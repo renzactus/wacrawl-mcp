@@ -173,6 +173,99 @@ async function renderToJpeg(srcPath) {
 const EXT_SOPORTADAS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.heic', '.gif', '.pdf', '.tiff', '.bmp']);
 
 /* ------------------------------------------------------------------ */
+/* borradores: el modelo redacta, la persona envía                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Nivel 1 de "enviar": NUNCA se envía nada. Se abre WhatsApp Desktop en el
+ * chat con el texto escrito en la caja, y la persona aprieta Enter.
+ *
+ * Las barreras viven acá y no en el prompt, porque un modelo que se desboca
+ * ignora instrucciones pero no un `if`. Los límites se persisten en disco para
+ * que reiniciar el server no los resetee.
+ */
+// Overridables sólo para test (check.sh): carpeta de estado y comando que abre.
+const DRAFTS_DIR = process.env.WACRAWL_DRAFTS_DIR || path.join(os.homedir(), '.wacrawl');
+const OPEN_BIN = process.env.WACRAWL_OPEN_BIN || '/usr/bin/open';
+const DRAFTS_LOG = path.join(DRAFTS_DIR, 'borradores.jsonl');
+const KILL_SWITCH = path.join(DRAFTS_DIR, 'STOP');
+const LIMITES = { porMinuto: 3, porHora: 15, largoMax: 2000, ventanaDifusionMin: 60 };
+
+function leerBorradores() {
+  try {
+    return fs.readFileSync(DRAFTS_LOG, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+const normalizarTexto = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').trim();
+
+/** Devuelve el motivo del bloqueo, o null si se puede abrir el borrador. */
+function chequearBarreras(telefono, texto) {
+  if (fs.existsSync(KILL_SWITCH)) {
+    return `Borradores DESACTIVADOS: existe ${KILL_SWITCH}. Borrá ese archivo para reactivarlos.`;
+  }
+  const ahora = Date.now();
+  const previos = leerBorradores();
+  const enVentana = (min) => previos.filter((b) => ahora - b.ts < min * 60000);
+
+  if (enVentana(1).length >= LIMITES.porMinuto) {
+    return `Límite: máximo ${LIMITES.porMinuto} borradores por minuto. Esperá un momento.`;
+  }
+  if (enVentana(60).length >= LIMITES.porHora) {
+    return `Límite: máximo ${LIMITES.porHora} borradores por hora. Esto frena una ráfaga; se libera solo.`;
+  }
+  // Anti-difusión: el mismo texto a OTRO destinatario es el patrón de un
+  // broadcast, que es lo que hace que WhatsApp banee cuentas.
+  const t = normalizarTexto(texto);
+  const repetido = enVentana(LIMITES.ventanaDifusionMin).find((b) => b.texto === t && b.telefono !== telefono);
+  if (repetido) {
+    return `Bloqueado: ese mismo texto ya se preparó para otro chat (${repetido.chat}) en la última hora. No se arman difusiones.`;
+  }
+  return null;
+}
+
+function registrarBorrador(entrada) {
+  fs.mkdirSync(path.dirname(DRAFTS_LOG), { recursive: true });
+  fs.appendFileSync(DRAFTS_LOG, JSON.stringify(entrada) + '\n');
+}
+
+/** Teléfono (sólo dígitos) de un chat, o error explicando por qué no hay. */
+async function telefonoDeChat(chat) {
+  const valor = String(chat).trim();
+
+  // Número escrito directamente
+  const digitos = valor.replace(/[\s\-().]/g, '').replace(/^\+/, '');
+  if (/^\d{8,15}$/.test(digitos)) {
+    const [previo] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(`${digitos}@s.whatsapp.net`)} LIMIT 1`);
+    return { telefono: digitos, nombre: previo?.name || `+${digitos}`, conocido: Boolean(previo) };
+  }
+
+  const jid = await resolveChatJID(valor);
+  const [fila] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(jid)} LIMIT 1`);
+  const nombre = fila?.name || valor;
+
+  if (jid.endsWith('@g.us')) {
+    throw new Error(`"${nombre}" es un grupo. WhatsApp sólo permite abrir chats individuales por enlace: abrí el grupo a mano.`);
+  }
+  if (jid.endsWith('@s.whatsapp.net')) {
+    return { telefono: jid.split('@')[0], nombre, conocido: true };
+  }
+  if (jid.endsWith('@lid')) {
+    const [ct] = await runSQL(
+      `SELECT jid FROM contacts WHERE lid = ${sqlString(jid)} AND deleted_at IS NULL AND jid LIKE '%@s.whatsapp.net' LIMIT 1`
+    );
+    if (ct) return { telefono: ct.jid.split('@')[0], nombre, conocido: true };
+    throw new Error(
+      `No tengo el número de "${nombre}": no está en tu agenda y WhatsApp oculta el número de los no agendados. ` +
+      `Si lo sabés, pasámelo directamente.`
+    );
+  }
+  throw new Error(`"${nombre}" no es un chat individual.`);
+}
+
+/* ------------------------------------------------------------------ */
 /* SQL helpers                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -412,7 +505,7 @@ BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas).
 
 CONTENIDO NO TEXTUAL: audios, imágenes y documentos aparecen con metadata pero sin transcripción ni OCR. Un audio se sabe que existe y cuándo, no qué dice. Además ~9% del texto son blobs no decodificables.
 
-ESCRITURA: este server no puede mandar, responder ni marcar nada. Es sólo lectura.`;
+ESCRITURA: este server NO puede enviar mensajes. Lo único que hace es preparar_mensaje: abre WhatsApp con un borrador escrito y Renzo decide si lo manda. Nunca digas que enviaste algo: decí que quedó listo para que él lo revise y lo mande. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicale el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
 
 const TOOLS = [
   {
@@ -519,6 +612,19 @@ const TOOLS = [
         destino: { type: 'string', description: 'Carpeta donde copiarlo. Default: ~/Downloads.' },
         limit: { type: 'integer', description: 'Máximo de archivos a exportar (default 1, máx 20).' },
       },
+    },
+  },
+  {
+    name: 'preparar_mensaje',
+    description:
+      'Abre WhatsApp Desktop en un chat individual con un mensaje YA ESCRITO en la caja de texto, listo para que Renzo lo revise y lo mande él apretando Enter. NO ENVÍA NADA: sólo deja el borrador. Usala cuando Renzo pida redactar o preparar un mensaje para alguien. No sirve para grupos. Tiene límites duros (pocos por minuto/hora, y nunca el mismo texto a varios chats).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: { type: 'string', description: 'Destinatario: nombre del chat, JID, o número de teléfono con código de país.' },
+        texto: { type: 'string', description: 'El mensaje a dejar escrito. Máx 2000 caracteres.' },
+      },
+      required: ['chat', 'texto'],
     },
   },
   {
@@ -785,6 +891,37 @@ const handlers = {
     return (
       `${hechos.length} archivo(s) copiado(s) a ${dir}:\n\n${hechos.join('\n')}` +
       (fallados.length ? `\n\nNo se pudieron copiar:\n${fallados.join('\n')}` : '')
+    );
+  },
+
+  async preparar_mensaje({ chat, texto }) {
+    if (!chat || !String(chat).trim()) throw new Error('`chat` es obligatorio.');
+    const cuerpo = String(texto || '').trim();
+    if (!cuerpo) throw new Error('`texto` está vacío.');
+    if (cuerpo.length > LIMITES.largoMax) {
+      throw new Error(`El texto tiene ${cuerpo.length} caracteres; el máximo es ${LIMITES.largoMax}.`);
+    }
+
+    const { telefono, nombre, conocido } = await telefonoDeChat(chat);
+
+    const bloqueo = chequearBarreras(telefono, cuerpo);
+    if (bloqueo) throw new Error(bloqueo);
+
+    const url = `whatsapp://send?phone=${telefono}&text=${encodeURIComponent(cuerpo)}`;
+    await new Promise((resolve, reject) => {
+      execFile(OPEN_BIN, [url], { timeout: 15000 }, (err, _out, stderr) =>
+        err ? reject(new Error(`No pude abrir WhatsApp: ${(stderr || err.message).toString().trim()}`)) : resolve()
+      );
+    });
+
+    registrarBorrador({ ts: Date.now(), telefono, chat: nombre, texto: normalizarTexto(cuerpo) });
+
+    const aviso = conocido
+      ? ''
+      : '\n\n⚠️ Nunca hablaste con este número. Verificá que sea el correcto antes de mandar.';
+    return (
+      `Abrí WhatsApp en el chat con "${nombre}" con el mensaje escrito.\n` +
+      `NO se envió nada: Renzo lo revisa y aprieta Enter si está bien.${aviso}`
     );
   },
 
