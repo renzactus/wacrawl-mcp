@@ -351,7 +351,11 @@ async function resolveChatJID(chat) {
   );
 
   if (rows.length === 0) {
-    throw new Error(`No encontré ningún chat que coincida con "${value}". Probá listar_chats para ver los nombres disponibles.`);
+    throw new Error(
+      `No encontré ningún chat que coincida con "${value}". Puede estar agendado con un apodo o sólo con el nombre: ` +
+      `probá con una parte (el apellido, el nombre de pila), usá listar_chats con un filtro, o preguntale a Renzo cómo lo tiene agendado. ` +
+      `No adivines cuál es: si hay dudas, preguntá.`
+    );
   }
 
   const exact = rows.filter((c) => (c.name || '').toLowerCase() === needle);
@@ -964,8 +968,16 @@ async function handleRequest(req) {
       if (!handler) throw new Error(`Tool desconocida: ${name}`);
       // Las tools devuelven texto, o ya un array de contenido MCP cuando
       // mandan imágenes junto con su contexto.
-      const salida = await handler(args || {});
-      return { content: Array.isArray(salida) ? salida : [{ type: 'text', text: salida }] };
+      // Un fallo de la tool (chat ambiguo, sin número, límite alcanzado) va como
+      // resultado con isError, NO como error de protocolo: Claude Desktop muestra
+      // los errores de protocolo como un "failed" pelado y el modelo nunca ve el
+      // motivo. Así veía "falló" sin saber que el nombre coincidía con 6 chats.
+      try {
+        const salida = await handler(args || {});
+        return { content: Array.isArray(salida) ? salida : [{ type: 'text', text: salida }] };
+      } catch (err) {
+        return { content: [{ type: 'text', text: err.message || String(err) }], isError: true };
+      }
     }
     default:
       throw Object.assign(new Error(`Método no soportado: ${req.method}`), { code: -32601 });
