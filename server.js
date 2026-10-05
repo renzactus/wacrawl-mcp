@@ -307,8 +307,9 @@ function notificar(texto) {
 /**
  * ¿Salió algún mensaje MÍO en ese chat desde `desdeMs`? No exige el mismo texto:
  * la persona puede corregir el borrador antes de mandarlo, y eso cuenta igual.
- * Mira el JID del chat y también el de teléfono, porque los chats @lid se
- * guardan con el lid y los números sueltos con el teléfono.
+ * OJO: un chat NUEVO (justo el caso de los mensajes en frío) WhatsApp lo crea
+ * con ZCONTACTJID = <algo>@lid, y deja el teléfono en ZCONTACTIDENTIFIER. Buscar
+ * sólo por ZCONTACTJID no lo encontraba nunca y la cola quedaba esperando.
  */
 async function detectarEnvio({ jid, telefono }, desdeMs) {
   if (process.env.WACRAWL_FAKE_SENT_FILE) {   // sólo para test
@@ -316,10 +317,12 @@ async function detectarEnvio({ jid, telefono }, desdeMs) {
     catch { return false; }
   }
   const jids = [...new Set([jid, `${telefono}@s.whatsapp.net`].filter(Boolean))];
+  const lista = jids.map(sqlString).join(', ');
   const desde = Math.floor(desdeMs / 1000) - APPLE_EPOCH - 5;
   const [fila] = await runLiveSQL(
     `SELECT count(*) AS n FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION` +
-    ` WHERE s.ZCONTACTJID IN (${jids.map(sqlString).join(', ')}) AND m.ZISFROMME = 1 AND m.ZMESSAGEDATE >= ${desde}`
+    ` WHERE (s.ZCONTACTJID IN (${lista}) OR s.ZCONTACTIDENTIFIER IN (${lista}))` +
+    ` AND m.ZISFROMME = 1 AND m.ZMESSAGEDATE >= ${desde}`
   );
   return (fila?.n ?? 0) > 0;
 }
