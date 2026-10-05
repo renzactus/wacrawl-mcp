@@ -32,6 +32,7 @@ histórico sigue intacto.
 | `ver_archivos` | archivo + disco | mirar imágenes y PDFs de verdad, no sólo saber que existen |
 | `exportar_archivo` | archivo + disco | sacar un adjunto a ~/Downloads para usarlo: subirlo, adjuntarlo, pasarlo a otra herramienta |
 | `preparar_mensaje` | abre WhatsApp | deja un mensaje **escrito pero sin enviar** en un chat; lo manda la persona con Enter |
+| `cola_mensajes` | abre WhatsApp + en vivo | varios borradores: abre el siguiente **cuando detecta que mandaste el actual** |
 
 Las tools del archivo avisan solas cuando quedó atrás, comparando contra WhatsApp en vivo
 (`wacrawl doctor`, ~1 s):
@@ -53,6 +54,25 @@ y los contadores se persisten en `~/.wacrawl/borradores.jsonl` para que reinicia
 - sólo chats individuales: WhatsApp no permite abrir grupos por enlace
 - aviso si el número nunca tuvo conversación
 - interruptor de emergencia: `touch ~/.wacrawl/STOP` desactiva todo; borrarlo lo reactiva
+
+### Varios mensajes: `cola_mensajes`
+
+WhatsApp **no conserva** el texto de un borrador si se abre otro chat. Por eso nunca se abren dos
+seguidos, ni con un timer (un timer pisa el borrador si la persona tarda en leer o corregir): el
+server vigila la base viva cada 2,5 s y abre el siguiente **recién cuando detecta un mensaje tuyo
+en ese chat**. Cuenta aunque hayas corregido el texto antes de mandarlo.
+
+- valida toda la lista antes de abrir el primero (grupos, números sin resolver, destinatarios o textos repetidos)
+- si no mandás uno en 10 min, se pausa; `reanudar` reabre ese mismo borrador, `saltar` pasa al siguiente
+- mientras hay una cola activa, `preparar_mensaje` se niega a abrir otro borrador
+- la detección necesita leer WhatsApp en vivo (permiso de macOS al runtime dedicado); sin él, la cola se pausa en vez de seguir a ciegas
+
+### Límites ajustables
+
+En `~/.wacrawl/limites.json`, por ejemplo `{"porHora": 40, "antiDifusion": false}`. Claves:
+`porMinuto` (3), `porHora` (15), `largoMax` (2000), `antiDifusion` (true), `colaMax` (30),
+`colaEsperaMin` (10). El riesgo de que WhatsApp restrinja la cuenta por conducta es de quien envía;
+lo que no es ajustable es que **nunca se envía nada solo**.
 
 Limitación: hace falta el número de teléfono. Los chats `@lid` se resuelven por la agenda; los de
 gente no agendada (~250) no tienen número visible — WhatsApp lo oculta a propósito.

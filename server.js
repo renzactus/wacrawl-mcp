@@ -189,7 +189,29 @@ const DRAFTS_DIR = process.env.WACRAWL_DRAFTS_DIR || path.join(os.homedir(), '.w
 const OPEN_BIN = process.env.WACRAWL_OPEN_BIN || '/usr/bin/open';
 const DRAFTS_LOG = path.join(DRAFTS_DIR, 'borradores.jsonl');
 const KILL_SWITCH = path.join(DRAFTS_DIR, 'STOP');
-const LIMITES = { porMinuto: 3, porHora: 15, largoMax: 2000, ventanaDifusionMin: 60 };
+const LIMITES_DEFAULT = {
+  porMinuto: 3,          // borradores sueltos (preparar_mensaje)
+  porHora: 15,
+  largoMax: 2000,
+  ventanaDifusionMin: 60,
+  antiDifusion: true,    // mismo texto a otro chat → bloqueado
+  colaMax: 30,           // mensajes por cola
+  colaEsperaMin: 10,     // sin envío en este lapso → la cola se pausa
+};
+/**
+ * Se pueden ajustar en ~/.wacrawl/limites.json (ej. {"porHora": 40}). Es
+ * decisión de la persona: el riesgo de que WhatsApp restrinja la cuenta es
+ * suyo. Lo que NO es ajustable es que nunca se envía nada solo.
+ */
+function cargarLimites() {
+  try {
+    const propio = JSON.parse(fs.readFileSync(path.join(DRAFTS_DIR, 'limites.json'), 'utf8'));
+    return { ...LIMITES_DEFAULT, ...propio };
+  } catch {
+    return { ...LIMITES_DEFAULT };
+  }
+}
+let LIMITES = cargarLimites();
 
 function leerBorradores() {
   try {
@@ -202,7 +224,8 @@ function leerBorradores() {
 const normalizarTexto = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').trim();
 
 /** Devuelve el motivo del bloqueo, o null si se puede abrir el borrador. */
-function chequearBarreras(telefono, texto) {
+function chequearBarreras(telefono, texto, { enCola = false } = {}) {
+  LIMITES = cargarLimites();
   if (fs.existsSync(KILL_SWITCH)) {
     return `Borradores DESACTIVADOS: existe ${KILL_SWITCH}. Borrá ese archivo para reactivarlos.`;
   }
@@ -210,7 +233,7 @@ function chequearBarreras(telefono, texto) {
   const previos = leerBorradores();
   const enVentana = (min) => previos.filter((b) => ahora - b.ts < min * 60000);
 
-  if (enVentana(1).length >= LIMITES.porMinuto) {
+  if (!enCola && enVentana(1).length >= LIMITES.porMinuto) {
     return `Límite: máximo ${LIMITES.porMinuto} borradores por minuto. Esperá un momento.`;
   }
   if (enVentana(60).length >= LIMITES.porHora) {
@@ -219,7 +242,8 @@ function chequearBarreras(telefono, texto) {
   // Anti-difusión: el mismo texto a OTRO destinatario es el patrón de un
   // broadcast, que es lo que hace que WhatsApp banee cuentas.
   const t = normalizarTexto(texto);
-  const repetido = enVentana(LIMITES.ventanaDifusionMin).find((b) => b.texto === t && b.telefono !== telefono);
+  const repetido = LIMITES.antiDifusion &&
+    enVentana(LIMITES.ventanaDifusionMin).find((b) => b.texto === t && b.telefono !== telefono);
   if (repetido) {
     return `Bloqueado: ese mismo texto ya se preparó para otro chat (${repetido.chat}) en la última hora. No se arman difusiones.`;
   }
@@ -239,7 +263,7 @@ async function telefonoDeChat(chat) {
   const digitos = valor.replace(/[\s\-().]/g, '').replace(/^\+/, '');
   if (/^\d{8,15}$/.test(digitos)) {
     const [previo] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(`${digitos}@s.whatsapp.net`)} LIMIT 1`);
-    return { telefono: digitos, nombre: previo?.name || `+${digitos}`, conocido: Boolean(previo) };
+    return { telefono: digitos, jid: `${digitos}@s.whatsapp.net`, nombre: previo?.name || `+${digitos}`, conocido: Boolean(previo) };
   }
 
   const jid = await resolveChatJID(valor);
@@ -250,19 +274,136 @@ async function telefonoDeChat(chat) {
     throw new Error(`"${nombre}" es un grupo. WhatsApp sólo permite abrir chats individuales por enlace: abrí el grupo a mano.`);
   }
   if (jid.endsWith('@s.whatsapp.net')) {
-    return { telefono: jid.split('@')[0], nombre, conocido: true };
+    return { telefono: jid.split('@')[0], jid, nombre, conocido: true };
   }
   if (jid.endsWith('@lid')) {
     const [ct] = await runSQL(
       `SELECT jid FROM contacts WHERE lid = ${sqlString(jid)} AND deleted_at IS NULL AND jid LIKE '%@s.whatsapp.net' LIMIT 1`
     );
-    if (ct) return { telefono: ct.jid.split('@')[0], nombre, conocido: true };
+    if (ct) return { telefono: ct.jid.split('@')[0], jid, nombre, conocido: true };
     throw new Error(
       `No tengo el número de "${nombre}": no está en tu agenda y WhatsApp oculta el número de los no agendados. ` +
       `Si lo sabés, pasámelo directamente.`
     );
   }
   throw new Error(`"${nombre}" no es un chat individual.`);
+}
+
+/** Abre WhatsApp en el chat con el texto escrito. No envía. */
+async function abrirBorrador({ telefono, nombre }, cuerpo, extra = {}) {
+  const url = `whatsapp://send?phone=${telefono}&text=${encodeURIComponent(cuerpo)}`;
+  await new Promise((resolve, reject) => {
+    execFile(OPEN_BIN, [url], { timeout: 15000 }, (err, _out, stderr) =>
+      err ? reject(new Error(`No pude abrir WhatsApp: ${(stderr || err.message).toString().trim()}`)) : resolve()
+    );
+  });
+  registrarBorrador({ ts: Date.now(), telefono, chat: nombre, texto: normalizarTexto(cuerpo), ...extra });
+}
+
+function notificar(texto) {
+  execFile('/usr/bin/osascript', ['-e', `display notification ${JSON.stringify(texto)} with title "wacrawl"`], () => {});
+}
+
+/**
+ * ¿Salió algún mensaje MÍO en ese chat desde `desdeMs`? No exige el mismo texto:
+ * la persona puede corregir el borrador antes de mandarlo, y eso cuenta igual.
+ * Mira el JID del chat y también el de teléfono, porque los chats @lid se
+ * guardan con el lid y los números sueltos con el teléfono.
+ */
+async function detectarEnvio({ jid, telefono }, desdeMs) {
+  if (process.env.WACRAWL_FAKE_SENT_FILE) {   // sólo para test
+    try { return fs.readFileSync(process.env.WACRAWL_FAKE_SENT_FILE, 'utf8').split('\n').includes(telefono); }
+    catch { return false; }
+  }
+  const jids = [...new Set([jid, `${telefono}@s.whatsapp.net`].filter(Boolean))];
+  const desde = Math.floor(desdeMs / 1000) - APPLE_EPOCH - 5;
+  const [fila] = await runLiveSQL(
+    `SELECT count(*) AS n FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION` +
+    ` WHERE s.ZCONTACTJID IN (${jids.map(sqlString).join(', ')}) AND m.ZISFROMME = 1 AND m.ZMESSAGEDATE >= ${desde}`
+  );
+  return (fila?.n ?? 0) > 0;
+}
+
+/**
+ * Cola de borradores. WhatsApp NO conserva el texto de un borrador si se abre
+ * otro chat, así que nunca se abren dos seguidos: el siguiente se abre recién
+ * cuando se detecta que la persona mandó el actual. El ritmo lo pone ella, no un
+ * timer (un timer pisa el borrador si alguien tarda en leer o corregir).
+ */
+let cola = null;
+const POLL_MS = Number(process.env.WACRAWL_COLA_POLL_MS) || 2500;
+
+function resumenCola() {
+  if (!cola) return 'No hay ninguna cola.';
+  const c = (e) => cola.items.filter((i) => i.estado === e).length;
+  const lineas = cola.items.map((i, n) => {
+    const marca = { enviado: '✓', salteado: '↷', abierto: '▶', pendiente: '·', error: '✗' }[i.estado];
+    return `${marca} ${n + 1}. ${i.nombre}${i.estado === 'error' ? ` — ${i.motivo}` : ''}`;
+  });
+  return (
+    `Cola ${cola.estado}: ${c('enviado')} enviados, ${c('salteado')} salteados, ` +
+    `${c('pendiente') + c('abierto')} por mandar.\n\n${lineas.join('\n')}`
+  );
+}
+
+async function abrirSiguiente() {
+  const i = cola.items.findIndex((x) => x.estado === 'pendiente');
+  if (i === -1) {
+    cola.estado = 'terminada';
+    clearInterval(cola.timer);
+    notificar(`Cola terminada: ${cola.items.filter((x) => x.estado === 'enviado').length} de ${cola.items.length} enviados.`);
+    return;
+  }
+  const item = cola.items[i];
+  const bloqueo = chequearBarreras(item.telefono, item.texto, { enCola: true });
+  if (bloqueo) {
+    cola.estado = 'pausada';
+    cola.motivo = bloqueo;
+    notificar(`Cola pausada: ${bloqueo}`);
+    return;
+  }
+  try {
+    await abrirBorrador(item, item.texto, { cola: true });
+    item.estado = 'abierto';
+    item.abiertoEn = Date.now();
+  } catch (err) {
+    item.estado = 'error';
+    item.motivo = err.message;
+    await abrirSiguiente();
+  }
+}
+
+async function vigilarCola() {
+  if (!cola || cola.estado !== 'activa' || cola.chequeando) return;
+  cola.chequeando = true;
+  try {
+    if (fs.existsSync(KILL_SWITCH)) {
+      cola.estado = 'cancelada';
+      clearInterval(cola.timer);
+      notificar('Cola cancelada: se activó STOP.');
+      return;
+    }
+    const item = cola.items.find((x) => x.estado === 'abierto');
+    if (!item) return;
+    if (await detectarEnvio(item, item.abiertoEn)) {
+      item.estado = 'enviado';
+      // pausa breve para que WhatsApp termine de mandar antes de cambiar de chat
+      await sleep(1500);
+      await abrirSiguiente();
+    } else if (Date.now() - item.abiertoEn > cargarLimites().colaEsperaMin * 60000) {
+      cola.estado = 'pausada';
+      cola.motivo = `no se mandó "${item.nombre}" en ${cargarLimites().colaEsperaMin} min`;
+      notificar(`Cola pausada: ${cola.motivo}.`);
+    }
+  } catch (err) {
+    // Sin permiso para leer WhatsApp en vivo no se puede detectar el envío:
+    // mejor frenar que seguir abriendo a ciegas.
+    cola.estado = 'pausada';
+    cola.motivo = `no pude chequear si se envió (${err.message.slice(0, 120)})`;
+    notificar('Cola pausada: no puedo detectar envíos.');
+  } finally {
+    if (cola) cola.chequeando = false;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -509,7 +650,7 @@ BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas).
 
 CONTENIDO NO TEXTUAL: audios, imágenes y documentos aparecen con metadata pero sin transcripción ni OCR. Un audio se sabe que existe y cuándo, no qué dice. Además ~9% del texto son blobs no decodificables.
 
-ESCRITURA: este server NO puede enviar mensajes. Lo único que hace es preparar_mensaje: abre WhatsApp con un borrador escrito y Renzo decide si lo manda. Nunca digas que enviaste algo: decí que quedó listo para que él lo revise y lo mande. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicale el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
+ESCRITURA: este server NO puede enviar mensajes. Lo único que hace es preparar_mensaje (uno) o cola_mensajes (varios, abre el siguiente cuando detecta que Renzo mandó el anterior): abre WhatsApp con un borrador escrito y Renzo decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Nunca digas que enviaste algo: decí que quedó listo para que él lo revise y lo mande. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicale el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
 
 const TOOLS = [
   {
@@ -629,6 +770,27 @@ const TOOLS = [
         texto: { type: 'string', description: 'El mensaje a dejar escrito. Máx 2000 caracteres.' },
       },
       required: ['chat', 'texto'],
+    },
+  },
+  {
+    name: 'cola_mensajes',
+    description:
+      'Para preparar VARIOS mensajes seguidos. Abre el primer borrador en WhatsApp y, cada vez que detecta que Renzo lo mandó, abre el siguiente solo. NO ENVÍA NADA: cada mensaje lo manda Renzo con Enter, a su ritmo. Si no manda uno en 10 min, la cola se pausa. Acciones: crear (con la lista), estado, saltar (pasa al siguiente sin mandar el actual), reanudar, cancelar. Para un único mensaje usá preparar_mensaje.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        accion: { type: 'string', enum: ['crear', 'estado', 'saltar', 'reanudar', 'cancelar'] },
+        mensajes: {
+          type: 'array',
+          description: 'Sólo para crear: lista de {chat, texto}, en el orden en que se van a abrir.',
+          items: {
+            type: 'object',
+            properties: { chat: { type: 'string' }, texto: { type: 'string' } },
+            required: ['chat', 'texto'],
+          },
+        },
+      },
+      required: ['accion'],
     },
   },
   {
@@ -906,19 +1068,16 @@ const handlers = {
       throw new Error(`El texto tiene ${cuerpo.length} caracteres; el máximo es ${LIMITES.largoMax}.`);
     }
 
-    const { telefono, nombre, conocido } = await telefonoDeChat(chat);
+    if (cola && cola.estado === 'activa') {
+      throw new Error('Hay una cola de mensajes en curso: abrir otro borrador pisaría el que Renzo está por mandar. Esperá a que termine o cancelala con cola_mensajes.');
+    }
+    const destino = await telefonoDeChat(chat);
+    const { nombre, conocido } = destino;
 
-    const bloqueo = chequearBarreras(telefono, cuerpo);
+    const bloqueo = chequearBarreras(destino.telefono, cuerpo);
     if (bloqueo) throw new Error(bloqueo);
 
-    const url = `whatsapp://send?phone=${telefono}&text=${encodeURIComponent(cuerpo)}`;
-    await new Promise((resolve, reject) => {
-      execFile(OPEN_BIN, [url], { timeout: 15000 }, (err, _out, stderr) =>
-        err ? reject(new Error(`No pude abrir WhatsApp: ${(stderr || err.message).toString().trim()}`)) : resolve()
-      );
-    });
-
-    registrarBorrador({ ts: Date.now(), telefono, chat: nombre, texto: normalizarTexto(cuerpo) });
+    await abrirBorrador(destino, cuerpo);
 
     const aviso = conocido
       ? ''
@@ -926,6 +1085,88 @@ const handlers = {
     return (
       `Abrí WhatsApp en el chat con "${nombre}" con el mensaje escrito.\n` +
       `NO se envió nada: Renzo lo revisa y aprieta Enter si está bien.${aviso}`
+    );
+  },
+
+  async cola_mensajes({ accion, mensajes }) {
+    if (accion === 'estado') return resumenCola();
+
+    if (accion === 'cancelar') {
+      if (!cola) return 'No hay ninguna cola.';
+      clearInterval(cola.timer);
+      cola.estado = 'cancelada';
+      return `Cola cancelada. El borrador que esté abierto queda en WhatsApp; no se abre ninguno más.\n\n${resumenCola()}`;
+    }
+
+    if (accion === 'saltar') {
+      if (!cola || !['activa', 'pausada'].includes(cola.estado)) return 'No hay una cola en curso.';
+      const actual = cola.items.find((x) => x.estado === 'abierto');
+      if (actual) actual.estado = 'salteado';
+      cola.estado = 'activa';
+      await abrirSiguiente();
+      return resumenCola();
+    }
+
+    if (accion === 'reanudar') {
+      if (!cola || cola.estado !== 'pausada') return 'No hay una cola pausada.';
+      cola.estado = 'activa';
+      cola.motivo = null;
+      const actual = cola.items.find((x) => x.estado === 'abierto');
+      // si se pausó por demora, reabrimos el mismo borrador (WhatsApp pudo haberlo perdido)
+      if (actual) { actual.estado = 'pendiente'; }
+      await abrirSiguiente();
+      return resumenCola();
+    }
+
+    if (accion !== 'crear') throw new Error(`Acción desconocida: ${accion}`);
+
+    if (cola && ['activa', 'pausada'].includes(cola.estado)) {
+      throw new Error('Ya hay una cola en curso. Cancelala o esperá a que termine antes de crear otra.');
+    }
+    if (fs.existsSync(KILL_SWITCH)) throw new Error(`Borradores DESACTIVADOS: existe ${KILL_SWITCH}.`);
+    const lim = cargarLimites();
+    if (!Array.isArray(mensajes) || mensajes.length === 0) throw new Error('`mensajes` está vacío.');
+    if (mensajes.length > lim.colaMax) {
+      throw new Error(`La cola tiene ${mensajes.length} mensajes; el máximo es ${lim.colaMax} (ajustable en ~/.wacrawl/limites.json).`);
+    }
+
+    // Validar TODO antes de abrir el primero: mejor fallar acá que a mitad de camino.
+    const items = [];
+    const problemas = [];
+    const vistos = new Map();
+    for (const [n, m] of mensajes.entries()) {
+      const texto = String(m.texto || '').trim();
+      try {
+        if (!texto) throw new Error('texto vacío');
+        if (texto.length > lim.largoMax) throw new Error(`texto de ${texto.length} caracteres (máx ${lim.largoMax})`);
+        const d = await telefonoDeChat(m.chat);
+        if (vistos.has(d.telefono)) throw new Error(`repite destinatario con el #${vistos.get(d.telefono)}`);
+        vistos.set(d.telefono, n + 1);
+        if (lim.antiDifusion) {
+          const igual = items.find((i) => normalizarTexto(i.texto) === normalizarTexto(texto));
+          if (igual) throw new Error(`mismo texto que el de ${igual.nombre} (anti-difusión)`);
+        }
+        items.push({ ...d, texto, estado: 'pendiente' });
+      } catch (err) {
+        problemas.push(`#${n + 1} ${m.chat}: ${err.message}`);
+      }
+    }
+    if (problemas.length) {
+      throw new Error(`No armé la cola; hay que corregir esto primero:\n${problemas.join('\n')}`);
+    }
+    if (items.length > lim.porHora) {
+      throw new Error(`La cola tiene ${items.length} mensajes y el límite es ${lim.porHora} por hora (ajustable en ~/.wacrawl/limites.json).`);
+    }
+
+    cola = { items, estado: 'activa', creada: Date.now() };
+    cola.timer = setInterval(vigilarCola, POLL_MS);
+    cola.timer.unref?.();
+    await abrirSiguiente();
+
+    return (
+      `Cola armada con ${items.length} mensajes. Abrí el primero en WhatsApp (${items[0].nombre}).\n` +
+      `Renzo lo revisa y aprieta Enter; cuando detecto que salió, abro el siguiente solo. ` +
+      `NO se envía nada automáticamente.\n\n${resumenCola()}`
     );
   },
 
@@ -986,7 +1227,7 @@ async function handleRequest(req) {
 
 // Importable desde check.sh para probar el renderizado sin levantar el server.
 if (require.main !== module) {
-  module.exports = { messageBody, senderLabel, formatMessages, looksLikeBlob, TIPOS };
+  module.exports = { messageBody, senderLabel, formatMessages, looksLikeBlob, TIPOS, detectarEnvio };
   return;
 }
 
