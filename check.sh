@@ -13,8 +13,15 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-WACRAWL="${WACRAWL_BIN:-$HOME/.local/bin/wacrawl}"
-NODE="$(command -v node || echo /opt/homebrew/bin/node)"
+WACRAWL="${WACRAWL_BIN:-}"
+if [ -z "$WACRAWL" ]; then
+  for c in "$HOME/.local/bin/wacrawl" /opt/homebrew/bin/wacrawl /usr/local/bin/wacrawl; do
+    [ -x "$c" ] && { WACRAWL="$c"; break; }
+  done
+fi
+[ -x "$WACRAWL" ] || { echo "✗ No encuentro wacrawl. Corré ./instalar.sh"; exit 1; }
+export WACRAWL_BIN="$WACRAWL"
+NODE="$DIR/runtime/bin/node"; [ -x "$NODE" ] || NODE="$(command -v node)"
 SOLO="${1:-todo}"
 
 sql() { "$WACRAWL" --sync never --json sql "$1"; }

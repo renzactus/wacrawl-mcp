@@ -9,7 +9,7 @@
  * Todas las lecturas van por `wacrawl sql`, que es de sólo lectura (rechaza
  * cualquier cosa que no sea un único SELECT) y tarda ~1-3s. Deliberadamente NO
  * usamos los subcomandos `chats` / `messages` / `search`: hacen un "backfill"
- * que escribe en la base y tardan MINUTOS sobre este archivo (~935k mensajes),
+ * que escribe en la base y tardan MINUTOS sobre un archivo de cientos de miles de mensajes,
  * lo que hacía que Claude Desktop cortara por timeout. Además `search` devuelve
  * muchísimos menos resultados que consultar el índice FTS directo.
  *
@@ -156,6 +156,12 @@ async function renderToJpeg(srcPath) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wacrawl-media-'));
   const out = path.join(dir, 'out.jpg');
   try {
+    const ext = extensionDe(srcPath);
+    if (ext && path.extname(srcPath).toLowerCase() !== ext) {
+      const conExt = path.join(dir, `in${ext}`);
+      fs.copyFileSync(srcPath, conExt);
+      srcPath = conExt;
+    }
     await new Promise((resolve, reject) => {
       execFile(
         SIPS_BIN,
@@ -171,6 +177,59 @@ async function renderToJpeg(srcPath) {
 }
 
 const EXT_SOPORTADAS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.heic', '.gif', '.pdf', '.tiff', '.bmp']);
+
+/**
+ * Extensión real de un adjunto. wacrawl 0.3.x copiaba la media con su nombre
+ * original (".../uuid.jpg"), pero 0.4.x la guarda por hash y SIN extensión
+ * (".../media/46/4637a2f5…"), y no registra el tipo en ningún lado. Entonces,
+ * si no hay extensión, la deducimos de los primeros bytes, como hace `file`.
+ */
+function extensionDe(ruta) {
+  const ext = path.extname(ruta).toLowerCase();
+  if (ext && ext.length <= 6) return ext;
+  let b;
+  try {
+    const fd = fs.openSync(ruta, 'r');
+    b = Buffer.alloc(4096);
+    const n = fs.readSync(fd, b, 0, 4096, 0);
+    fs.closeSync(fd);
+    b = b.subarray(0, n);
+  } catch {
+    return '';
+  }
+  const asc = (i, len) => b.toString('latin1', i, i + len);
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return '.jpg';
+  if (asc(0, 4) === '\x89PNG') return '.png';
+  if (asc(0, 4) === '%PDF') return '.pdf';
+  if (asc(0, 4) === 'GIF8') return '.gif';
+  if (asc(0, 4) === 'RIFF' && asc(8, 4) === 'WEBP') return '.webp';
+  if (asc(0, 4) === 'OggS') return '.opus';
+  if (asc(4, 4) === 'ftyp') {
+    const marca = asc(8, 4);
+    if (['heic', 'heix', 'mif1', 'msf1'].includes(marca)) return '.heic';
+    if (marca === 'M4A ') return '.m4a';
+    if (marca === 'qt  ') return '.mov';
+    return '.mp4';
+  }
+  if (asc(0, 4) === 'PK\x03\x04') {          // Office moderno = zip
+    // El índice de un zip está al FINAL: miramos el principio y la cola.
+    let cola = Buffer.alloc(0);
+    try {
+      const fd = fs.openSync(ruta, 'r');
+      const tam = fs.fstatSync(fd).size;
+      cola = Buffer.alloc(Math.min(65536, tam));
+      fs.readSync(fd, cola, 0, cola.length, Math.max(0, tam - cola.length));
+      fs.closeSync(fd);
+    } catch { /* con el principio alcanza */ }
+    const cuerpo = b.toString('latin1') + cola.toString('latin1');
+    if (cuerpo.includes('word/')) return '.docx';
+    if (cuerpo.includes('xl/')) return '.xlsx';
+    if (cuerpo.includes('ppt/')) return '.pptx';
+    return '.zip';
+  }
+  if (/^\s*<(!doctype html|html)/i.test(asc(0, 64))) return '.html';
+  return '';
+}
 
 /* ------------------------------------------------------------------ */
 /* borradores: el modelo redacta, la persona envía                     */
@@ -497,7 +556,7 @@ async function resolveChatJID(chat) {
   if (rows.length === 0) {
     throw new Error(
       `No encontré ningún chat que coincida con "${value}". Puede estar agendado con un apodo o sólo con el nombre: ` +
-      `probá con una parte (el apellido, el nombre de pila), usá listar_chats con un filtro, o preguntale a Renzo cómo lo tiene agendado. ` +
+      `probá con una parte (el apellido, el nombre de pila), usá listar_chats con un filtro, o preguntale al usuario cómo lo tiene agendado. ` +
       `No adivines cuál es: si hay dudas, preguntá.`
     );
   }
@@ -641,19 +700,19 @@ async function commonFilters({ chat, desde, hasta, de_mi }) {
  * los datos y cuándo NO confiar en ellos. Las cifras salen de medir este
  * archivo, no de estimaciones.
  */
-const SERVER_INSTRUCTIONS = `Acceso de sólo lectura al archivo local de WhatsApp de Renzo (~935k mensajes). Cómo interpretar los resultados:
+const SERVER_INSTRUCTIONS = `Acceso al WhatsApp local del usuario: un archivo histórico (sólo lectura) más WhatsApp Desktop en vivo. Cómo interpretar los resultados:
 
-PROFUNDIDAD REAL: el 99,9% del archivo es de los últimos ~19 meses (2025-2026). Antes de 2025 hay ~625 registros y casi sin texto. Si no encontrás algo viejo, es que WhatsApp Desktop no lo guarda localmente — decilo así, no como "no encontré".
+PROFUNDIDAD: el archivo tiene lo que WhatsApp Desktop recibió del teléfono al vincularse, más todo lo que llegó después. Suele cubrir meses, no años. Si no encontrás algo viejo, decí que no está en el archivo local — no que no existe.
 
-FRESCURA: el archivo se sincroniza cada 6h y un sync tarda ~5 min, así que NO se puede refrescar durante una consulta. Las tools avisan explícitamente cuando detectan mensajes más nuevos sin importar. Para "¿me contestó recién?" el archivo no sirve: hay que mirar WhatsApp directamente.
+FRESCURA: el archivo se sincroniza cada 6h y un sync tarda minutos, así que NO se puede refrescar durante una consulta. Las tools avisan cuando detectan mensajes más nuevos sin importar. Para "¿me contestó recién?" usá mensajes_recientes, que lee WhatsApp en vivo.
 
-QUIÉN DIJO QUÉ: en DMs la atribución es confiable. En grupos, ~103k mensajes de texto no tienen nombre de remitente y aparecen como "(no identificado · <jid>@lid)"; ese lid es estable por persona, así que sirve para saber que dos mensajes son del mismo desconocido, pero NO para ponerle nombre. Nunca inventes de quién es un mensaje así, ni lo atribuyas al dueño del chat.
+QUIÉN DIJO QUÉ: en chats individuales la atribución es confiable. En grupos, muchos mensajes de gente no agendada aparecen como "(no identificado · <jid>@lid)": WhatsApp no guarda su nombre. Ese lid es estable por persona (sirve para saber que dos mensajes son del mismo desconocido) pero NO para ponerle nombre. Nunca inventes de quién es un mensaje así, ni lo atribuyas al dueño del chat. Los "[estado]" son historias publicadas, no mensajes dirigidos al usuario.
 
-BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas). Si devuelve poco o nada, reintentá con busqueda_profunda, que matchea subcadenas y suele encontrar más. Los conteos que reportan son exactos sobre todo el archivo; los mensajes mostrados están topeados por 'limit', así que cualquier síntesis de un período largo sale de una MUESTRA — decilo cuando corresponda en vez de presentarla como completa.
+BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas). Si devuelve poco o nada, reintentá con busqueda_profunda, que matchea subcadenas. Los conteos son exactos sobre todo el archivo; los mensajes mostrados están topeados por 'limit', así que una síntesis de un período largo sale de una MUESTRA — decilo en vez de presentarla como completa. Si un nombre no aparece, la persona puede estar agendada con un apodo: preguntá, no adivines.
 
-CONTENIDO NO TEXTUAL: audios, imágenes y documentos aparecen con metadata pero sin transcripción ni OCR. Un audio se sabe que existe y cuándo, no qué dice. Además ~9% del texto son blobs no decodificables.
+ADJUNTOS: imágenes y PDFs se pueden MIRAR con ver_archivos y SACAR a una carpeta con exportar_archivo. Sólo existen los archivos que WhatsApp Desktop descargó (desde que se vinculó). Los audios no tienen transcripción: se sabe que existen y cuándo, no qué dicen.
 
-ESCRITURA: este server NO puede enviar mensajes. Lo único que hace es preparar_mensaje (uno) o cola_mensajes (varios, abre el siguiente cuando detecta que Renzo mandó el anterior): abre WhatsApp con un borrador escrito y Renzo decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Nunca digas que enviaste algo: decí que quedó listo para que él lo revise y lo mande. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicale el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
+ESCRITURA: este server NO puede enviar mensajes. Sólo prepara borradores: preparar_mensaje (uno) o cola_mensajes (varios; abre el siguiente cuando detecta que el usuario mandó el anterior). Abre WhatsApp con el texto escrito y el usuario decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Nunca digas que enviaste algo: decí que quedó listo para que lo revise y lo mande. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicá el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
 
 const TOOLS = [
   {
@@ -765,7 +824,7 @@ const TOOLS = [
   {
     name: 'preparar_mensaje',
     description:
-      'Abre WhatsApp Desktop en un chat individual con un mensaje YA ESCRITO en la caja de texto, listo para que Renzo lo revise y lo mande él apretando Enter. NO ENVÍA NADA: sólo deja el borrador. Usala cuando Renzo pida redactar o preparar un mensaje para alguien. No sirve para grupos. Tiene límites duros (pocos por minuto/hora, y nunca el mismo texto a varios chats).',
+      'Abre WhatsApp Desktop en un chat individual con un mensaje YA ESCRITO en la caja de texto, listo para que el usuario lo revise y lo mande apretando Enter. NO ENVÍA NADA: sólo deja el borrador. Usala cuando el usuario pida redactar o preparar un mensaje para alguien. No sirve para grupos. Tiene límites duros (pocos por minuto/hora, y nunca el mismo texto a varios chats).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -778,7 +837,7 @@ const TOOLS = [
   {
     name: 'cola_mensajes',
     description:
-      'Para preparar VARIOS mensajes seguidos. Abre el primer borrador en WhatsApp y, cada vez que detecta que Renzo lo mandó, abre el siguiente solo. NO ENVÍA NADA: cada mensaje lo manda Renzo con Enter, a su ritmo. Si no manda uno en 10 min, la cola se pausa. Acciones: crear (con la lista), estado, saltar (pasa al siguiente sin mandar el actual), reanudar, cancelar. Para un único mensaje usá preparar_mensaje.',
+      'Para preparar VARIOS mensajes seguidos. Abre el primer borrador en WhatsApp y, cada vez que detecta que el usuario lo mandó, abre el siguiente solo. NO ENVÍA NADA: cada mensaje lo manda el usuario con Enter, a su ritmo. Si no manda uno en 10 min, la cola se pausa. Acciones: crear (con la lista), estado, saltar (pasa al siguiente sin mandar el actual), reanudar, cancelar. Para un único mensaje usá preparar_mensaje.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -952,8 +1011,9 @@ const handlers = {
         problemas.push(`${m.timestamp} ${m.chat_name}: el archivo ya no está en disco`);
         continue;
       }
-      if (!EXT_SOPORTADAS.has(path.extname(ruta).toLowerCase())) {
-        problemas.push(`${m.timestamp} ${m.chat_name}: ${path.extname(ruta)} no se puede mostrar`);
+      const ext = extensionDe(ruta);
+      if (!EXT_SOPORTADAS.has(ext)) {
+        problemas.push(`${m.timestamp} ${m.chat_name}: ${ext || 'formato desconocido'} no se puede mostrar (usá exportar_archivo)`);
         continue;
       }
       try {
@@ -1032,7 +1092,7 @@ const handlers = {
         limpio(senderLabel(m)),
       ].filter(Boolean).join('_');
 
-      const ext = path.extname(m.media_path);
+      const ext = extensionDe(m.media_path);
       let salida = path.join(dir, `${base}${ext}`);
       for (let i = 2; fs.existsSync(salida); i += 1) salida = path.join(dir, `${base}-${i}${ext}`);
 
@@ -1072,7 +1132,7 @@ const handlers = {
     }
 
     if (cola && cola.estado === 'activa') {
-      throw new Error('Hay una cola de mensajes en curso: abrir otro borrador pisaría el que Renzo está por mandar. Esperá a que termine o cancelala con cola_mensajes.');
+      throw new Error('Hay una cola de mensajes en curso: abrir otro borrador pisaría el que el usuario está por mandar. Esperá a que termine o cancelala con cola_mensajes.');
     }
     const destino = await telefonoDeChat(chat);
     const { nombre, conocido } = destino;
@@ -1087,7 +1147,7 @@ const handlers = {
       : '\n\n⚠️ Nunca hablaste con este número. Verificá que sea el correcto antes de mandar.';
     return (
       `Abrí WhatsApp en el chat con "${nombre}" con el mensaje escrito.\n` +
-      `NO se envió nada: Renzo lo revisa y aprieta Enter si está bien.${aviso}`
+      `NO se envió nada: el usuario lo revisa y aprieta Enter si está bien.${aviso}`
     );
   },
 
@@ -1168,7 +1228,7 @@ const handlers = {
 
     return (
       `Cola armada con ${items.length} mensajes. Abrí el primero en WhatsApp (${items[0].nombre}).\n` +
-      `Renzo lo revisa y aprieta Enter; cuando detecto que salió, abro el siguiente solo. ` +
+      `El usuario lo revisa y aprieta Enter; cuando detecto que salió, abro el siguiente solo. ` +
       `NO se envía nada automáticamente.\n\n${resumenCola()}`
     );
   },

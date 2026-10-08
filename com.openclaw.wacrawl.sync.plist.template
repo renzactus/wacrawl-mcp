@@ -10,7 +10,7 @@
          Sin él, un sync roto pasa desapercibido durante días. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/renzactus/workspace/wacrawl-mcp/sync-wrapper.sh</string>
+        <string>__WRAPPER__</string>
     </array>
 
     <!-- cada 6 horas -->
@@ -24,8 +24,8 @@
     <integer>5</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/renzactus/.wacrawl/sync.log</string>
+    <string>__HOME__/.wacrawl/sync.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/renzactus/.wacrawl/sync.err.log</string>
+    <string>__HOME__/.wacrawl/sync.err.log</string>
 </dict>
 </plist>

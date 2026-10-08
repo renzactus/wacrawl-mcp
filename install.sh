@@ -1,32 +1,34 @@
 #!/bin/bash
 # Instala el agente de launchd que mantiene el archivo de wacrawl al día.
 #
-# El sync tarda ~5,4 min sobre un archivo de ~935k mensajes (no hay incremental),
-# así que corre en background cada 6h y NO al vuelo desde el MCP server.
+# El sync tarda varios minutos (wacrawl no tiene import incremental: re-mergea
+# todo), así que corre en background cada 6h y NO al vuelo desde el MCP server.
+# Llama a sync-wrapper.sh, que además se auto-recupera y avisa si algo falla.
 
 set -euo pipefail
 
 LABEL="com.openclaw.wacrawl.sync"
-SRC="$(cd "$(dirname "$0")" && pwd)/$LABEL.plist"
+REPO="$(cd "$(dirname "$0")" && pwd)"
+TEMPLATE="$REPO/$LABEL.plist.template"
 DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
-[ -f "$SRC" ] || { echo "✗ No encuentro $SRC"; exit 1; }
+[ -f "$TEMPLATE" ] || { echo "✗ No encuentro $TEMPLATE"; exit 1; }
+[ -x "$REPO/sync-wrapper.sh" ] || chmod +x "$REPO/sync-wrapper.sh"
 
-command -v "$HOME/.local/bin/wacrawl" >/dev/null 2>&1 || {
-  echo "✗ Falta ~/.local/bin/wacrawl — instalalo antes (ver README)."
-  exit 1
-}
+WACRAWL=""
+for c in "$HOME/.local/bin/wacrawl" /opt/homebrew/bin/wacrawl /usr/local/bin/wacrawl; do
+  [ -x "$c" ] && { WACRAWL="$c"; break; }
+done
+[ -n "$WACRAWL" ] || { echo "✗ No encuentro wacrawl. Corré ./instalar.sh primero."; exit 1; }
 
-mkdir -p "$HOME/Library/LaunchAgents"
-cp "$SRC" "$DEST"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.wacrawl"
+sed -e "s|__WRAPPER__|$REPO/sync-wrapper.sh|" -e "s|__HOME__|$HOME|g" "$TEMPLATE" > "$DEST"
 plutil -lint "$DEST" >/dev/null
 
 # bootout es idempotente: si no estaba cargado, no importa que falle.
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$DEST"
 
-echo "✓ Agente instalado. Estado:"
-launchctl print "gui/$(id -u)/$LABEL" | grep -E "state = |run interval|last exit code" || true
-echo
-echo "→ Para forzar un sync ahora:  launchctl kickstart -k gui/$(id -u)/$LABEL"
-echo "→ Log:                        ~/.wacrawl/sync.log"
+echo "✓ Sync automático instalado (cada 6 horas)."
+echo "  Forzar uno ahora:  launchctl kickstart -k gui/$(id -u)/$LABEL"
+echo "  Registro:          ~/.wacrawl/wrapper.log"

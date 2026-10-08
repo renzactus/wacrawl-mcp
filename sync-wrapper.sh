@@ -3,24 +3,41 @@
 #
 # El agente de launchd llama a ESTE script, no a wacrawl directo.
 #
-# Por qué existe: el 2026-08-09 WhatsApp Desktop recompactó su base local y
-# renumeró los source_pk. wacrawl se negó a mergear ("belongs to a different
-# event") para no corromper el archivo — correcto — pero abortó en silencio
-# durante 4 días. Renzo se enteró de casualidad, en medio de una búsqueda,
-# porque una respuesta le pareció vieja.
+# Por qué existe: cuando WhatsApp Desktop se re-vincula o se actualiza, a veces
+# recompacta su base local y renumera los source_pk. wacrawl entonces se niega a
+# mergear ("belongs to a different event") para no corromper el archivo — bien —
+# pero sin esto el sync aborta en silencio cada 6h y nadie se entera hasta que
+# una respuesta parece vieja. Pasó: estuvo 4 días roto sin aviso.
 #
-# El error no fue el problema. El silencio sí.
+# El error no es el problema. El silencio sí.
 
 set -uo pipefail
 
-WACRAWL="${WACRAWL_BIN:-$HOME/.local/bin/wacrawl}"
+# launchd corre con un PATH mínimo: buscamos wacrawl donde suele instalarse.
+WACRAWL="${WACRAWL_BIN:-}"
+if [ -z "$WACRAWL" ]; then
+  for c in "$HOME/.local/bin/wacrawl" /opt/homebrew/bin/wacrawl /usr/local/bin/wacrawl; do
+    [ -x "$c" ] && { WACRAWL="$c"; break; }
+  done
+fi
 DIR="$HOME/.wacrawl"
 DB="$DIR/wacrawl.db"
 LOG="$DIR/wrapper.log"
-MAX_BACKUPS=2          # cada backup son ~635 MB, no acumular
+MAX_BACKUPS=2          # cada backup pesa lo que el archivo (cientos de MB): no acumular
 FRESH_LIMIT_H=12       # avisar si el archivo se atrasa más que esto
 
+mkdir -p "$DIR"
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+# Un único valor de un SELECT, sin depender de python3 (que en una Mac sin
+# herramientas de desarrollador abre un instalador en vez de correr).
+sql_valor() { "$WACRAWL" --sync never sql "$1" 2>/dev/null | tail -1; }
+
+if [ -z "$WACRAWL" ] || [ ! -x "$WACRAWL" ]; then
+  log "no encuentro wacrawl"
+  osascript -e 'display notification "No encuentro wacrawl: el sync no corre." with title "wacrawl"' >/dev/null 2>&1 || true
+  exit 1
+fi
 
 notify() {
   # osascript falla mudo si no hay permiso de notificaciones, así que además
@@ -33,10 +50,8 @@ notify() {
 # un sync fallido igual toca la base y el mtime miente.
 data_age_hours() {
   local last
-  last=$("$WACRAWL" --sync never --json sql \
-    "SELECT max(ts) AS t FROM messages WHERE deleted_at IS NULL" 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['t'])" 2>/dev/null) || return 1
-  [ -n "$last" ] || return 1
+  last=$(sql_valor "SELECT max(ts) FROM messages WHERE deleted_at IS NULL")
+  [[ "$last" =~ ^[0-9]+$ ]] || return 1
   echo $(( ( $(date +%s) - last ) / 3600 ))
 }
 
@@ -54,22 +69,18 @@ if [ $RC -ne 0 ]; then
     BAK="$DB.bak-$(date +%Y%m%d-%H%M%S)"
     log "error conocido, intento recuperar. backup -> $BAK"
 
-    # Sin backup no se toca nada: el archivo tiene 10 años de historial que
-    # WhatsApp Desktop ya no necesariamente conserva.
+    # Sin backup no se toca nada: el archivo puede tener historial que WhatsApp
+    # Desktop ya no conserva.
     if ! cp "$DB" "$BAK"; then
       log "BACKUP FALLO — aborto sin tocar el archivo"
       notify "Backup falló. Sync detenido, archivo intacto."
       exit 1
     fi
 
-    ANTES=$("$WACRAWL" --sync never --json sql \
-      "SELECT count(*) AS n FROM messages" 2>/dev/null \
-      | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['n'])" 2>/dev/null || echo 0)
+    ANTES=$(sql_valor "SELECT count(*) FROM messages"); ANTES=${ANTES:-0}
 
     if OUT2=$("$WACRAWL" import --restore --copy-media 2>&1); then
-      DESPUES=$("$WACRAWL" --sync never --json sql \
-        "SELECT count(*) AS n FROM messages" 2>/dev/null \
-        | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['n'])" 2>/dev/null || echo 0)
+      DESPUES=$(sql_valor "SELECT count(*) FROM messages"); DESPUES=${DESPUES:-0}
       log "restore OK: $ANTES -> $DESPUES mensajes"
 
       # El riesgo real del restore es que WhatsApp tenga MENOS historial que el

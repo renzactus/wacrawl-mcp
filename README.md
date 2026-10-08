@@ -1,174 +1,185 @@
-# wacrawl-mcp
+# WhatsApp para Claude (wacrawl-mcp)
 
-MCP server (stdio) que le da a Claude Desktop acceso de **sólo lectura** al WhatsApp local de esta Mac.
+Le da a **Claude Desktop** acceso a tu WhatsApp, desde tu Mac: buscar en todas tus conversaciones,
+leer hilos, ver imágenes y PDFs que te mandaron, y dejarte mensajes **escritos pero sin enviar**
+para que los mandes vos.
 
-Todo local: sin dependencias npm, sin red, sin nube. Nunca escribe, mueve ni borra ninguna base.
+Todo corre en tu computadora. Tus chats no se suben a ningún servidor (ver [Privacidad](#privacidad)).
 
-## Las dos fuentes
+## Qué le podés pedir
 
-La decisión de diseño central: hay **dos** bases, y cada tool sabe de cuál lee.
+- *"¿Qué me dijo Juan sobre la propuesta la semana pasada?"*
+- *"Buscá en todos mis chats dónde se habló de la factura de marzo."*
+- *"¿Cuáles son mis últimos 5 chats? ¿Me contestó Ana?"*
+- *"Mostrame el PDF que me mandó Laura ayer"* — y lo lee de verdad.
+- *"Pasame a Descargas la foto del contrato que mandaron en el grupo."*
+- *"Prepará un follow-up para Pedro con lo que hablamos"* — te abre WhatsApp con el mensaje escrito; lo mandás vos.
+- *"Armá mensajes personalizados para estas 6 personas"* — te los va abriendo de a uno, a medida que mandás.
 
-| | Archivo (wacrawl) | En vivo (WhatsApp) |
-|---|---|---|
-| Qué es | `~/.wacrawl/wacrawl.db` | `ChatStorage.sqlite` de WhatsApp Desktop |
-| Frescura | hasta 6h atrás | **segundos** |
-| Búsqueda | full-text (FTS5) + subcadena | sólo últimos N mensajes |
-| Profundidad | ~935k mensajes | lo que tenga la app |
-| Velocidad | 1-3 s | 0,05 s |
+## Requisitos
 
-**Por qué no una sola tool "inteligente" que elija:** conviene saber cuál contestó. Si el esquema
-CoreData de WhatsApp cambia en una actualización de Meta, se rompe sólo la tool en vivo y el
-histórico sigue intacto.
+| | |
+|---|---|
+| **Mac** con macOS 13 o más nuevo | no anda en Windows/Linux ([ver alternativa](#windows-o-linux)) |
+| **WhatsApp Desktop** (la app de Mac, no WhatsApp Web), vinculada con tu teléfono | [whatsapp.com/download](https://www.whatsapp.com/download) o App Store |
+| **Claude Desktop** | [claude.ai/download](https://claude.ai/download) |
+| **Node.js 18+** | [nodejs.org](https://nodejs.org) o `brew install node` |
 
-## Tools
-
-| Tool | Fuente | Para qué |
-|---|---|---|
-| `buscar_whatsapp` | archivo | búsqueda full-text, rápida. La opción por defecto |
-| `busqueda_profunda` | archivo | barrido por subcadena, encuentra dentro de palabras. Más lenta, más completa |
-| `listar_chats` | archivo | chats por actividad reciente o por volumen, con no leídos |
-| `leer_chat` | archivo | un hilo en orden cronológico |
-| `mensajes_recientes` | **en vivo** | "¿me contestó?", lo de hace segundos |
-| `ver_archivos` | archivo + disco | mirar imágenes y PDFs de verdad, no sólo saber que existen |
-| `exportar_archivo` | archivo + disco | sacar un adjunto a ~/Downloads para usarlo: subirlo, adjuntarlo, pasarlo a otra herramienta |
-| `preparar_mensaje` | abre WhatsApp | deja un mensaje **escrito pero sin enviar** en un chat; lo manda la persona con Enter |
-| `cola_mensajes` | abre WhatsApp + en vivo | varios borradores: abre el siguiente **cuando detecta que mandaste el actual** |
-
-Las tools del archivo avisan solas cuando quedó atrás, comparando contra WhatsApp en vivo
-(`wacrawl doctor`, ~1 s):
-
-> ⚠️ El archivo está 2 h atrás de WhatsApp: hay mensajes más nuevos que todavía no entraron.
-
-## Borradores, no envíos
-
-`preparar_mensaje` **no envía nada**: abre WhatsApp Desktop vía `whatsapp://send` con el texto en la
-caja, y la persona aprieta Enter. Lo manda la app oficial, así que no hay riesgo de ban por cliente
-no oficial. Verificado contra la base viva: el conteo de mensajes del chat no cambia al abrir un
-borrador.
-
-Las barreras están en código, no en el prompt (un modelo desbocado ignora instrucciones, no un `if`),
-y los contadores se persisten en `~/.wacrawl/borradores.jsonl` para que reiniciar no los resetee:
-
-- máximo 3 borradores por minuto y 15 por hora
-- **anti-difusión**: el mismo texto (ignorando mayúsculas y espacios) a otro chat en la última hora → bloqueado
-- sólo chats individuales: WhatsApp no permite abrir grupos por enlace
-- aviso si el número nunca tuvo conversación
-- interruptor de emergencia: `touch ~/.wacrawl/STOP` desactiva todo; borrarlo lo reactiva
-
-### Varios mensajes: `cola_mensajes`
-
-WhatsApp **no conserva** el texto de un borrador si se abre otro chat. Por eso nunca se abren dos
-seguidos, ni con un timer (un timer pisa el borrador si la persona tarda en leer o corregir): el
-server vigila la base viva cada 2,5 s y abre el siguiente **recién cuando detecta un mensaje tuyo
-en ese chat**. Cuenta aunque hayas corregido el texto antes de mandarlo.
-
-- valida toda la lista antes de abrir el primero (grupos, números sin resolver, destinatarios o textos repetidos)
-- si no mandás uno en 10 min, se pausa; `reanudar` reabre ese mismo borrador, `saltar` pasa al siguiente
-- mientras hay una cola activa, `preparar_mensaje` se niega a abrir otro borrador
-- la detección necesita leer WhatsApp en vivo (permiso de macOS al runtime dedicado); sin él, la cola se pausa en vez de seguir a ciegas
-
-### Límites ajustables
-
-En `~/.wacrawl/limites.json`, por ejemplo `{"porHora": 40, "antiDifusion": false}`. Claves:
-`porMinuto` (3), `porHora` (15), `largoMax` (2000), `antiDifusion` (true), `colaMax` (30),
-`colaEsperaMin` (10). El riesgo de que WhatsApp restrinja la cuenta por conducta es de quien envía;
-lo que no es ajustable es que **nunca se envía nada solo**.
-
-Limitación: hace falta el número de teléfono. Los chats `@lid` se resuelven por la agenda; los de
-gente no agendada (~250) no tienen número visible — WhatsApp lo oculta a propósito.
+No necesita skills, plugins ni configuración extra en Claude: el server le explica a Claude cómo
+usar cada herramienta y cómo interpretar los resultados.
 
 ## Instalación
 
-```bash
-# 1. wacrawl (la fórmula sólo extrae un binario; no compila)
-brew install openclaw/tap/wacrawl
-wacrawl doctor && wacrawl import --copy-media
-
-# 2. copia dedicada de node (ver "Permisos de macOS")
-./setup-runtime.sh
-
-# 3. el agente de sync cada 6h
-./install.sh
-
-# 4. registrar el server en Claude Desktop (con la app CERRADA)
-./register.sh
-```
-
-## Permisos de macOS
-
-Claude Desktop lanza los MCP servers vía `Contents/Helpers/disclaimer`, que corta la herencia de
-permisos: el proceso responsable ante macOS pasa a ser **node**, no Claude. Por eso aparece
-*"node would like to access data from other apps"* al leer el container de WhatsApp — y por eso
-darle el permiso a Claude no sirve. Tampoco sirve leer vía wacrawl: macOS mira el proceso
-responsable, no el binario que abre el archivo.
-
-Dos defensas, y conviene tener las dos:
-
-1. **`--copy-media` en el sync** deja los adjuntos en `~/.wacrawl/media`, fuera de la zona
-   protegida. `ver_archivos` no necesita ningún permiso. Cuesta ~780 MB duplicados.
-2. **`./setup-runtime.sh`** arma una copia de node en `runtime/`, usada sólo por este server. Se le
-   da Acceso completo al disco a **esa** ruta, así `npx -y mongodb-mcp-server` y cualquier otro
-   script de node NO lo heredan. Además la ruta es estable: el node de Homebrew está firmado
-   ad-hoc, así que cada update le cambia la identidad y el permiso se pierde.
-
-Sólo `mensajes_recientes` (que lee la base viva) depende de ese permiso. Sin él, las otras cuatro
-tools siguen funcionando.
-
-> **`register.sh` exige que Claude Desktop esté cerrado, y no es capricho.** La app lee
-> `claude_desktop_config.json` al arrancar y **lo reescribe desde memoria al salir**: si se edita con
-> la app abierta, el ⌘Q borra la entrada. Cerrar → editar → abrir.
-
-Si `brew install` falla con *"Command Line Tools are too outdated"*, la fórmula igual sólo hace
-`bin.install` de un tarball de release: bajalo de la URL que declara, verificá su `sha256` e
-instalalo en `~/.local/bin`.
-
-## Limitaciones reales (medidas, no estimadas)
-
-1. **El histórico es de ~19 meses, no de 10 años.** El 99,93% del archivo es 2025-2026; antes de
-   2025 hay 625 registros y prácticamente sin texto. WhatsApp Desktop no guarda esa historia local.
-2. **Ventana ciega de hasta 6h en las tools del archivo.** El sync tarda ~5,4 min aunque entren 181
-   mensajes (`import` no tiene incremental: re-mergea los 935k). No entra en un tool call — Claude
-   Desktop corta a los 4 min. Para eso está `mensajes_recientes`.
-3. **En grupos, ~103k mensajes no tienen remitente identificable.** No es un bug de acá: WhatsApp
-   guarda el nombre vacío y un `@lid` opaco, y esos remitentes no están en la agenda. Verificado
-   contra la base viva. Se muestra el `@lid`, que al menos es estable por persona. **Los DMs no
-   están afectados.**
-4. **La media local arranca el 2026-08-06.** Ese día WhatsApp Desktop empezó a
-   descargarla (la política ya estaba en `image/audio/video/document = 1`); de antes
-   no hay un solo archivo en esta Mac, aunque el mensaje figure. De ahí en adelante la
-   cobertura es ~70% y crece sola. Las miniaturas `.thumb` no sirven: son JPEG de 72x72.
-5. **Los audios no se transcriben**: se sabe que existen y cuándo, no qué dicen.
-6. Los conteos son exactos (se cuentan sobre el total), pero cualquier síntesis de un período largo
-   sale de una muestra acotada por `limit`.
-
-## Notas de implementación
-
-Cosas que cuesta caro volver a descubrir:
-
-- **Nunca usar los subcomandos `chats` / `messages` / `search` de wacrawl.** Hacen un "backfill" que
-  escribe y tarda **minutos** (medido: `chats --limit 2000` colgado 2m40s). Todo va por `wacrawl sql`,
-  que es sólo lectura y tarda 1-3 s. Este fue el bug de los timeouts.
-- **`wacrawl search` está roto de cobertura**, no el índice: por FTS via SQL, "error" en un grupo da
-  69 resultados; el subcomando daba 1.
-- **La tabla `messages` guarda cada conversación repetida** (mismo `msg_id`, distinto `source_pk`).
-  Hay que agrupar por `msg_id, chat_jid, ts, text` **antes** del LIMIT, o los conteos salen ~3x
-  inflados y el limit devuelve de menos.
-- **`chats.last_message_at` tiene filas corruptas** (año 9026) que encabezarían cualquier orden por
-  fecha. Se ordena por `max(ts)` de los mensajes reales.
-- **Las llamadas al CLI van serializadas.** Dos en paralelo dan `SQLITE_BUSY` porque el auto-sync
-  escribe. Hay reintento con backoff por si el agente de launchd está corriendo.
-- **La base viva se abre con `mode=ro` + `-readonly`.** Nunca se escribe ni se crea WAL.
-- Claude Desktop no hereda el PATH del shell: todas las rutas en la config son absolutas.
-- **Los PDF se renderizan a imagen con `sips`, no se les extrae el texto.** macOS no trae nada
-  nativo para extraerlo (Spotlight no indexa el container de WhatsApp, PyObjC no está), y
-  renderizar funciona igual con PDFs escaneados. Sale sólo la primera página.
-- **Nunca `process.exit()` con contenido pendiente en stdout**: trunca la respuesta, y una imagen
-  en base64 no se vacía de una sola pasada.
-
-## Verificar que anda
+**1. Bajá el repo y corré el instalador** (en Terminal):
 
 ```bash
-launchctl print gui/$(id -u)/com.openclaw.wacrawl.sync | grep -E "state|last exit"
-tail ~/.wacrawl/sync.log
-grep -i wacrawl ~/Library/Logs/Claude/mcp.log | tail -20
+git clone https://github.com/renzactus/wacrawl-mcp.git ~/wacrawl-mcp
+cd ~/wacrawl-mcp
+./instalar.sh
 ```
+
+(El repo es privado: necesitás que te den acceso en GitHub, y tener `git` autenticado — por ejemplo
+con `gh auth login`.)
+
+Chequea los requisitos, instala `wacrawl` (verificando su checksum), arma tu archivo local, deja un
+sync automático cada 6 horas, y te dice lo que falta. La primera importación tarda varios minutos.
+
+Si macOS pregunta si **Terminal** puede acceder a datos de otras apps, aceptá: es para leer WhatsApp.
+
+**2. Dale el permiso de disco** (macOS no deja hacerlo por script):
+
+Ajustes del Sistema → **Privacidad y seguridad** → **Acceso total al disco** → botón **+** →
+**⌘⇧G** → pegá la ruta que te mostró el instalador (termina en `/runtime/bin/node`) → **Abrir** → activalo.
+
+> Ese permiso es sólo para una copia de node que usa **únicamente** este server — no para el node
+> de tu sistema. Así ningún otro programa lo hereda. Sin él igual funciona casi todo; sólo no
+> podés ver lo que llegó hace segundos ni usar la cola de mensajes.
+
+**3. Registralo en Claude, con Claude cerrado:**
+
+Cerrá Claude Desktop con **⌘Q** (cerrar la ventana no alcanza) y corré:
+
+```bash
+~/wacrawl-mcp/register.sh
+```
+
+Abrí Claude Desktop. Listo.
+
+> **Por qué hay que cerrarlo:** Claude Desktop lee su configuración al abrir y **la reescribe al
+> cerrarse**. Si la editás con la app abierta, al cerrarla se borra lo que agregaste. El script se
+> niega a correr si detecta Claude abierto, para protegerte de eso. Si el instalador vio Claude
+> cerrado, ya hizo este paso por vos.
+
+## Probar que anda
+
+Preguntale a Claude: *"¿cuáles son mis últimos 3 chats de WhatsApp?"*
+
+Si algo no anda, corré el diagnóstico — muestra cómo se ve cada tipo de mensaje, si los horarios
+están bien, cuánto atraso tiene el archivo y si el sync automático está funcionando:
+
+```bash
+~/wacrawl-mcp/check.sh
+```
+
+(usa `python3`; si macOS ofrece instalar las herramientas de desarrollador, aceptá.)
+
+## Privacidad
+
+**Qué queda en tu Mac:** todo tu WhatsApp. El archivo (`~/.wacrawl/`), las imágenes y documentos, y
+el server mismo. Nada de eso se sube a ningún lado.
+
+**Qué sale de tu Mac:** sólo lo que Claude *lee* para contestarte. Si le preguntás por un chat, los
+mensajes que consulta pasan a esa conversación de Claude, igual que si los hubieras pegado vos. Eso
+queda en tu historial de Claude como cualquier otro chat.
+
+**Cuentas de Claude compartidas:** el acceso a tu WhatsApp es de **tu Mac**, no de la cuenta. Otra
+persona que entre a la misma cuenta desde otra computadora **no** puede consultar tu WhatsApp. Pero
+**sí puede ver tus conversaciones de Claude**, incluidos los mensajes de WhatsApp que Claude leyó en
+ellas. Si varias personas usan la misma cuenta, cada una tiene que asumir que las demás ven lo que
+consultó. Lo recomendable es una cuenta por persona (un plan Team, por ejemplo).
+
+**Nunca envía nada.** Puede dejarte un mensaje escrito en WhatsApp, pero el que aprieta Enter sos
+vos. No hay forma de que mande algo solo.
+
+## Mandar mensajes (borradores)
+
+Claude no envía: **abre WhatsApp en el chat con el mensaje escrito** y vos lo revisás y mandás.
+
+- **Uno:** *"prepará un mensaje para Ana diciendo…"*
+- **Varios:** *"armá mensajes para estas personas y abrímelos en cola"*. Abre el primero; **cuando
+  detecta que lo mandaste, abre el siguiente** (tarda ~3 s). Si te tomás tu tiempo con uno, espera.
+  Si no mandás uno en 10 minutos, se pausa. Le podés decir *saltar*, *reanudar* o *cancelar*.
+
+Barreras que vienen activadas, por si un modelo se desboca:
+
+- máximo 3 borradores por minuto y 15 por hora
+- no deja preparar **el mismo texto para varias personas** (patrón de difusión, que WhatsApp castiga)
+- sólo chats individuales: WhatsApp no permite abrir grupos así
+- avisa si es un número con el que nunca hablaste
+- **botón de emergencia:** `touch ~/.wacrawl/STOP` frena todo; borrás ese archivo y vuelve
+
+Las podés ajustar en `~/.wacrawl/limites.json`, por ejemplo `{"porHora": 40, "antiDifusion": false}`.
+Claves: `porMinuto`, `porHora`, `largoMax`, `antiDifusion`, `colaMax`, `colaEsperaMin`.
+
+> **Ojo con los mensajes en frío.** Que lo mandes vos a mano evita el riesgo de usar un cliente no
+> oficial, pero WhatsApp igual puede restringir un número si muchos desconocidos lo bloquean o lo
+> reportan. Poco volumen y mensajes realmente personalizados.
+
+## Lo que no hace (y conviene saber)
+
+- **No tiene todo tu historial.** Tiene lo que WhatsApp Desktop recibió del teléfono al vincularse
+  (suelen ser meses, no años) más todo lo que llegó desde entonces. Si algo viejo no aparece, no
+  está en tu Mac.
+- **El archivo va hasta 6 horas atrás.** Actualizarlo tarda minutos, así que se hace en segundo
+  plano. Para lo de último momento, Claude lee WhatsApp en vivo (necesita el permiso del paso 2).
+- **En grupos grandes, muchos mensajes no tienen nombre de quién los mandó**: WhatsApp no guarda el
+  nombre de la gente que no tenés agendada. Los chats individuales no tienen este problema.
+- **Sólo hay archivos (fotos, PDFs) desde que vinculaste WhatsApp Desktop.** Los de antes nunca se
+  bajaron a la Mac.
+- **No transcribe audios**: sabe que existen, no qué dicen.
+- **Para preparar un mensaje necesita el número de teléfono.** Funciona con tus contactos agendados;
+  para gente no agendada WhatsApp oculta el número, y tenés que pasárselo vos.
+- Si alguien está agendado con un apodo, buscalo por cómo lo tenés agendado.
+
+## Problemas comunes
+
+| Síntoma | Qué hacer |
+|---|---|
+| No aparece en Claude | Cerrá con **⌘Q**, corré `register.sh`, abrí. Si lo registraste con Claude abierto, se borró al cerrar. |
+| macOS pregunta *"node would like to access data from other apps"* cada vez | Falta el paso 2 (o se le dio el permiso a otro node). Tiene que ser la ruta que termina en `/runtime/bin/node`. |
+| La cola no pasa al siguiente | Necesita el permiso del paso 2 para detectar que mandaste. Pedile *"estado de la cola"*: te dice por qué se pausó. |
+| Las respuestas parecen viejas | `check.sh` → sección "Salud del sync". El sync se repara solo si WhatsApp renumeró su base; si no, te avisa con una notificación. |
+| "No encontré ningún chat" con alguien que sí tenés | Está agendado con otro nombre o un apodo. Decile cómo lo tenés agendado. |
+
+Registro del sync automático: `~/.wacrawl/wrapper.log`.
+
+## Actualizar
+
+```bash
+cd ~/wacrawl-mcp && git pull
+```
+
+Cerrá y abrí Claude Desktop (⌘Q). No hace falta volver a registrar ni a dar permisos.
+
+## Desinstalar
+
+```bash
+launchctl bootout gui/$(id -u)/com.openclaw.wacrawl.sync
+rm ~/Library/LaunchAgents/com.openclaw.wacrawl.sync.plist
+```
+
+Con Claude cerrado, sacá el bloque `"wacrawl"` de
+`~/Library/Application Support/Claude/claude_desktop_config.json`, y quitá la entrada de node en
+Acceso total al disco. Tu archivo de WhatsApp queda en `~/.wacrawl/`: borralo sólo si estás seguro,
+porque puede tener mensajes que tu WhatsApp ya no tiene.
+
+## Windows o Linux
+
+Esto depende de leer los archivos de WhatsApp Desktop para Mac. Para Windows/Linux, el mismo autor
+de wacrawl tiene [wacli](https://github.com/openclaw/wacli): se vincula como dispositivo por QR,
+guarda todo en SQLite local y tiene binarios para Windows. Encima se puede montar un server como este.
+
+---
+
+Cómo está hecho, por qué de cada decisión, y lo que cuesta caro volver a descubrir:
+[NOTAS-TECNICAS.md](NOTAS-TECNICAS.md).
