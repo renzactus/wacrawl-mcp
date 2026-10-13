@@ -137,7 +137,7 @@ if [ "$SOLO" = todo ] || [ "$SOLO" = audios ]; then
     echo "  transcriptos: $HECHOS de ~$EN_DISCO audios en disco ($VACIOS sin voz detectable)"
     echo "  con vocabulario: $CONVOC $( [ -f "$HOME/.wacrawl/vocabulario.txt" ] || echo '(no hay ~/.wacrawl/vocabulario.txt)')"
     ULT=$(grep -v Warning "$HOME/.wacrawl/transcribir.log" 2>/dev/null | grep -E "^transcriptos|^nada|^corte|^ya hay" | tail -1)
-    [ -n "$ULT" ] && echo "  última pasada: $ULT"
+    [ -n "$ULT" ] && echo "  última pasada terminada: $ULT"
     pgrep -f "transcribir.py --(pendientes|rehacer)" >/dev/null && echo "  (hay una pasada corriendo ahora)"
   fi
   echo
