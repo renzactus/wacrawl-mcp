@@ -1408,9 +1408,11 @@ const handlers = {
     }
 
     const nuevos = faltan.filter((r) => r.transcripcion !== undefined).length;
+    const fallidos = faltan.length - nuevos;
     const notas = [];
     if (yaEstaban) notas.push(`${yaEstaban} ya estaban transcriptos`);
     if (nuevos) notas.push(`${nuevos} transcriptos ahora`);
+    if (fallidos) notas.push(`${fallidos} no se pudieron leer (archivo de audio dañado o incompleto; se puede escuchar en WhatsApp)`);
     if (sinArchivo.length) notas.push(`${sinArchivo.length} sin archivo en esta Mac (WhatsApp Desktop no los descargó; suelen ser anteriores a vincularlo)`);
     rows.reverse();   // del más viejo al más nuevo, como se escucharían
     return `${rows.length} audio(s)${chat ? ` en "${rows[0].chat_name || chat}"` : ''} — ${notas.join(', ')}.\n` +

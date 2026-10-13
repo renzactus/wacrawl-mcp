@@ -91,11 +91,24 @@ def pendientes(db, limite):
 def a_wav(ruta, tmp):
     """Pasa el audio a WAV 16 kHz mono con afconvert (nativo de macOS, lee el Opus de WhatsApp).
     Se le da una extensión explícita porque wacrawl 0.4.x guarda la media sin extensión."""
-    entrada = os.path.join(tmp, "in.opus")
+    # La extensión tiene que coincidir con el contenido: afconvert no abre un MP4
+    # que se llama .opus. wacrawl 0.4.x guarda sin extensión, así que se mira el archivo.
+    with open(ruta, "rb") as f:
+        cab = f.read(12)
+    if cab[:4] == b"OggS":
+        ext = ".opus"
+    elif cab[4:8] == b"ftyp":
+        ext = ".m4a"
+    elif cab[:4] == b"RIFF" and cab[8:12] == b"WAVE":
+        ext = ".wav"
+    elif cab[:3] == b"ID3" or cab[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        ext = ".mp3"
+    else:
+        ext = os.path.splitext(ruta)[1] or ".opus"
+    entrada = os.path.join(tmp, "in" + ext)
     salida = os.path.join(tmp, "out.wav")
-    for f in (entrada, salida):
-        if os.path.lexists(f):
-            os.remove(f)
+    for viejo in os.listdir(tmp):
+        os.remove(os.path.join(tmp, viejo))
     os.symlink(ruta, entrada)
     subprocess.run(["/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", entrada, salida],
                    check=True, capture_output=True)
