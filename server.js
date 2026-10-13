@@ -469,6 +469,135 @@ async function vigilarCola() {
 }
 
 /* ------------------------------------------------------------------ */
+/* transcripciones de audio (Whisper local, ver transcribir.py)        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Las transcripciones viven en una base APARTE (~/.wacrawl/transcripciones.sqlite):
+ * el archivo de wacrawl nunca se escribe. Las hace transcribir.py, en segundo
+ * plano después de cada sync, o en el momento con la tool transcribir_audios.
+ * Función y no constante: DRAFTS_DIR se declara más abajo.
+ */
+const transcDb = () => path.join(DRAFTS_DIR, 'transcripciones.sqlite');
+const WHISPER = (() => {
+  const v = { python: '3.12', paquete: 'mlx-whisper==0.4.3', modelo: 'mlx-community/whisper-large-v3-turbo' };
+  try {   // whisper.env es la fuente de verdad, compartida con los scripts
+    for (const l of fs.readFileSync(path.join(__dirname, 'whisper.env'), 'utf8').split('\n')) {
+      const m = l.match(/^WHISPER_(PYTHON|PAQUETE|MODELO)=(.+)$/);
+      if (m) v[{ PYTHON: 'python', PAQUETE: 'paquete', MODELO: 'modelo' }[m[1]]] = m[2].trim();
+    }
+  } catch { /* defaults */ }
+  return v;
+})();
+
+async function runTranscSQL(sql) {
+  if (!fs.existsSync(transcDb())) return [];
+  const out = (await runWacrawl(['--db', transcDb(), '--sync', 'never', '--json', 'sql', sql])).trim();
+  if (!out) return [];
+  const p = JSON.parse(out);
+  return (Array.isArray(p) ? p : [p]).filter((r) => r && typeof r === 'object');
+}
+
+/** Pega la transcripción (si existe) a cada fila de audio. "" = no se detectó voz. */
+async function adjuntarTranscripciones(rows) {
+  const audios = rows.filter((r) => r.message_type === 'audio' && r.message_id);
+  if (!audios.length) return rows;
+  const ids = [...new Set(audios.map((r) => r.message_id))];
+  let tr;
+  try {
+    tr = await runTranscSQL(`SELECT msg_id, chat_jid, texto FROM transcripciones WHERE msg_id IN (${ids.map(sqlString).join(', ')})`);
+  } catch {
+    return rows;   // sin transcripciones se muestra "(audio)" como siempre
+  }
+  const mapa = new Map(tr.map((t) => [`${t.msg_id}|${t.chat_jid}`, t.texto ?? '']));
+  for (const r of audios) {
+    const k = `${r.message_id}|${r.chat_jid}`;
+    if (mapa.has(k)) r.transcripcion = mapa.get(k);
+  }
+  return rows;
+}
+
+/** Busca en lo que se DIJO en los audios. Devuelve null si no hay transcripciones. */
+async function buscarEnAudios({ terms, jid, desde, hasta, de_mi, limite }) {
+  if (!fs.existsSync(transcDb())) return null;
+  const w = ["texto <> ''"];
+  for (const t of terms) w.push(`lower(texto) LIKE ${sqlString(`%${likeLiteral(t.toLowerCase())}%`)} ESCAPE '\\'`);
+  if (jid) w.push(`chat_jid = ${sqlString(jid)}`);
+  if (desde) w.push(`ts >= ${toEpoch(desde, 'desde')}`);
+  if (hasta) w.push(`ts < ${toEpoch(hasta, 'hasta')}`);
+  if (typeof de_mi === 'boolean') w.push(`from_me = ${de_mi ? 1 : 0}`);
+  const clause = w.join(' AND ');
+  let total, hits;
+  try {
+    const [c] = await runTranscSQL(`SELECT count(*) AS n FROM transcripciones WHERE ${clause}`);
+    total = c?.n ?? 0;
+    hits = total ? await runTranscSQL(`SELECT msg_id, chat_jid, texto FROM transcripciones WHERE ${clause} ORDER BY ts DESC LIMIT ${limite}`) : [];
+  } catch {
+    return null;
+  }
+  if (!hits.length) return { total, rows: [] };
+  // Los datos para mostrar (quién, dónde, cuándo) salen del archivo, como el resto.
+  const rows = await selectMessages(
+    'messages m', `m.deleted_at IS NULL AND m.msg_id IN (${hits.map((h) => sqlString(h.msg_id)).join(', ')})`, 'DESC', limite * 2
+  );
+  const mapa = new Map(hits.map((h) => [`${h.msg_id}|${h.chat_jid}`, h.texto]));
+  const conTexto = rows
+    .filter((r) => mapa.has(`${r.message_id}|${r.chat_jid}`))
+    .map((r) => ({ ...r, transcripcion: mapa.get(`${r.message_id}|${r.chat_jid}`) }));
+  return { total, rows: conTexto.slice(0, limite) };
+}
+
+function seccionAudios(res) {
+  if (!res || !res.total) return '';
+  const shown = res.total > res.rows.length ? ` (mostrando ${res.rows.length})` : '';
+  return `\n\nEn audios (transcriptos): ${res.total}${shown}:\n\n${formatMessages(res.rows, { withChat: true })}`;
+}
+
+/** uv + modelo bajado + script. Si falta algo, error con la instrucción para arreglarlo. */
+function whisperListo() {
+  const uv = [process.env.WACRAWL_UV, path.join(os.homedir(), '.local/bin/uv'), '/opt/homebrew/bin/uv', '/usr/local/bin/uv',
+    path.join(os.homedir(), '.cargo/bin/uv')].find((p) => p && fs.existsSync(p));
+  const modelo = path.join(os.homedir(), '.cache/huggingface/hub', `models--${WHISPER.modelo.replace('/', '--')}`);
+  const script = path.join(__dirname, 'transcribir.py');
+  if (!uv || !fs.existsSync(modelo) || !fs.existsSync(script)) {
+    throw new Error(
+      'La transcripción de audios no está instalada en esta Mac. Hay que correr una vez ./setup-whisper.sh ' +
+      '(baja el modelo, ~1,6 GB; después todo corre local y sin conexión).'
+    );
+  }
+  return { uv, script };
+}
+
+/** Corre transcribir.py con la lista por stdin; devuelve {clave: texto}. Sin red. */
+function correrTranscriptor({ uv, script }, items) {
+  return new Promise((resolve, reject) => {
+    const { spawn } = require('node:child_process');
+    const hijo = spawn(uv, ['run', '--quiet', '--python', WHISPER.python, '--with', WHISPER.paquete, 'python', script, '--stdin'], {
+      env: {
+        HOME: os.homedir(), PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+        UV_OFFLINE: '1', HF_HUB_OFFLINE: '1', HF_HUB_DISABLE_TELEMETRY: '1', WACRAWL_DIR: DRAFTS_DIR, WHISPER_MODELO: WHISPER.modelo,
+      },
+    });
+    let out = '', err = '';
+    const reloj = setTimeout(() => { hijo.kill(); reject(new Error('La transcripción tardó demasiado; probá con menos audios.')); }, 170000);
+    hijo.stdout.on('data', (d) => (out += d));
+    hijo.stderr.on('data', (d) => (err += d));
+    hijo.on('error', (e) => { clearTimeout(reloj); reject(e); });
+    hijo.on('close', (code) => {
+      clearTimeout(reloj);
+      const res = {};
+      for (const l of out.split('\n').filter(Boolean)) {
+        try { const j = JSON.parse(l); res[`${j.msg_id}|${j.chat_jid}`] = j.texto; } catch { /* línea ajena */ }
+      }
+      if (code !== 0 && !Object.keys(res).length) {
+        reject(new Error(`No pude transcribir: ${err.split('\n').filter((x) => x && !/Warning/.test(x)).slice(-2).join(' ').slice(0, 200)}`));
+      } else resolve(res);
+    });
+    hijo.stdin.end(JSON.stringify(items));
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* SQL helpers                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -506,7 +635,7 @@ const GROUPING = 'GROUP BY m.msg_id, m.chat_jid, m.ts, m.text';
 
 const MSG_COLUMNS =
   `m.msg_id AS message_id, m.chat_jid, m.chat_name, m.sender_name, m.sender_jid,` +
-  ` m.from_me, m.text, m.message_type, m.media_title, m.media_path,` +
+  ` m.from_me, m.text, m.message_type, m.media_title, m.media_path, m.ts,` +
   // Hora LOCAL de esta Mac. En UTC los mensajes de la noche caen al día
   // siguiente y todo se lee corrido.
   ` strftime('%Y-%m-%d %H:%M', m.ts, 'unixepoch', 'localtime') AS timestamp`;
@@ -616,6 +745,9 @@ const TIPOS = {
  * mandamos el tipo.
  */
 function messageBody(m) {
+  if (m.message_type === 'audio' && m.transcripcion !== undefined) {
+    return m.transcripcion ? `(audio) «${m.transcripcion}»` : '(audio sin voz detectable)';
+  }
   const texto = m.text ? String(m.text).trim() : '';
   if (texto && !looksLikeBlob(texto)) return texto;
 
@@ -710,7 +842,7 @@ QUIÉN DIJO QUÉ: en chats individuales la atribución es confiable. En grupos, 
 
 BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas). Si devuelve poco o nada, reintentá con busqueda_profunda, que matchea subcadenas. Los conteos son exactos sobre todo el archivo; los mensajes mostrados están topeados por 'limit', así que una síntesis de un período largo sale de una MUESTRA — decilo en vez de presentarla como completa. Si un nombre no aparece, la persona puede estar agendada con un apodo: preguntá, no adivines.
 
-ADJUNTOS: imágenes y PDFs se pueden MIRAR con ver_archivos y SACAR a una carpeta con exportar_archivo. Sólo existen los archivos que WhatsApp Desktop descargó (desde que se vinculó). Los audios no tienen transcripción: se sabe que existen y cuándo, no qué dicen.
+ADJUNTOS: imágenes y PDFs se pueden MIRAR con ver_archivos y SACAR a una carpeta con exportar_archivo. Sólo existen los archivos que WhatsApp Desktop descargó (desde que se vinculó). AUDIOS: si la transcripción local está instalada, las notas de voz aparecen como (audio) «texto» y también salen en las búsquedas (sección "En audios"). Es transcripción automática con Whisper: el sentido es confiable, pero los nombres propios y términos en inglés pueden salir mal — no los cites como exactos. Si un audio aparece como "(audio)" sin texto, todavía no se transcribió: usá transcribir_audios. "(audio sin voz detectable)" es silencio o ruido.
 
 ESCRITURA: este server NO puede enviar mensajes. Sólo prepara borradores: preparar_mensaje (uno) o cola_mensajes (varios; abre el siguiente cuando detecta que el usuario mandó el anterior). Abre WhatsApp con el texto escrito y el usuario decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Nunca digas que enviaste algo: decí que quedó listo para que lo revise y lo mande. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicá el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
 
@@ -856,6 +988,20 @@ const TOOLS = [
     },
   },
   {
+    name: 'transcribir_audios',
+    description:
+      'Transcribe notas de voz que todavía no tienen texto, con Whisper corriendo en esta Mac (no sale nada de la computadora). Los audios ya transcriptos aparecen solos como (audio) «texto» en leer_chat y en las búsquedas: usá esto sólo si ves "(audio)" sin texto y hace falta saber qué dice. Tarda unos segundos por audio (más ~5 s la primera vez).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: { type: 'string', description: 'Opcional: audios de un chat, por nombre o JID.' },
+        desde: { type: 'string', description: 'Opcional: sólo posteriores. YYYY-MM-DD o RFC3339.' },
+        hasta: { type: 'string', description: 'Opcional: sólo anteriores. YYYY-MM-DD o RFC3339.' },
+        limit: { type: 'integer', description: 'Máximo de audios (default 5, máx 15), los más recientes.' },
+      },
+    },
+  },
+  {
     name: 'leer_chat',
     description:
       'Lee los mensajes de un chat en orden cronológico (del más viejo al más nuevo), con remitente y fecha.',
@@ -878,17 +1024,19 @@ const handlers = {
     const max = clampLimit(limit, 50, 500);
 
     const from = 'messages_fts f JOIN messages m ON m.rowid = f.rowid';
-    const where = await commonFilters({ chat, desde, hasta, de_mi });
+    const jid = chat ? await resolveChatJID(chat) : null;
+    const where = await commonFilters({ chat: jid, desde, hasta, de_mi });
     where.push(`messages_fts MATCH ${sqlString(ftsPhrase(String(query).trim()))}`);
     const clause = where.join(' AND ');
 
     const total = await countDistinct(from, clause);
-    const rows = await selectMessages(from, clause, 'DESC', max);
+    const rows = await adjuntarTranscripciones(await selectMessages(from, clause, 'DESC', max));
+    const audios = await buscarEnAudios({ terms: [String(query).trim()], jid, desde, hasta, de_mi, limite: Math.min(max, 20) });
 
     const scope = chat ? ` en ${chat}` : '';
     const shown = total > rows.length ? ` (mostrando ${rows.length})` : '';
-    const hint = total === 0 ? '\n\nSugerencia: probá busqueda_profunda, que busca subcadenas y suele encontrar más.' : '';
-    return `${total} mensaje(s) para "${query}"${scope}${shown}:\n\n${formatMessages(rows, { withChat: true })}${hint}${await freshnessNote()}`;
+    const hint = total === 0 && !audios?.total ? '\n\nSugerencia: probá busqueda_profunda, que busca subcadenas y suele encontrar más.' : '';
+    return `${total} mensaje(s) para "${query}"${scope}${shown}:\n\n${formatMessages(rows, { withChat: true })}${seccionAudios(audios)}${hint}${await freshnessNote()}`;
   },
 
   async listar_chats({ filtro, orden, solo_no_leidos, limit }) {
@@ -924,7 +1072,8 @@ const handlers = {
     const max = clampLimit(limit, 50, 500);
 
     const terms = todas_las_palabras ? String(query).trim().split(/\s+/) : [String(query).trim()];
-    const where = await commonFilters({ chat, desde, hasta, de_mi });
+    const jid = chat ? await resolveChatJID(chat) : null;
+    const where = await commonFilters({ chat: jid, desde, hasta, de_mi });
     where.push('m.text IS NOT NULL');
     for (const t of terms) {
       where.push(`lower(m.text) LIKE ${sqlString(`%${likeLiteral(t.toLowerCase())}%`)} ESCAPE '\\'`);
@@ -932,12 +1081,13 @@ const handlers = {
     const clause = where.join(' AND ');
 
     const total = await countDistinct('messages m', clause);
-    const rows = await selectMessages('messages m', clause, 'DESC', max);
+    const rows = await adjuntarTranscripciones(await selectMessages('messages m', clause, 'DESC', max));
+    const audios = await buscarEnAudios({ terms, jid, desde, hasta, de_mi, limite: Math.min(max, 20) });
 
     const modo = todas_las_palabras ? 'todas las palabras' : 'frase literal';
     const scope = chat ? ` en ${chat}` : '';
     const shown = total > rows.length ? ` (mostrando ${rows.length})` : '';
-    return `${total} coincidencia(s) para "${query}"${scope} — ${modo}${shown}:\n\n${formatMessages(rows, { withChat: true })}${await freshnessNote()}`;
+    return `${total} coincidencia(s) para "${query}"${scope} — ${modo}${shown}:\n\n${formatMessages(rows, { withChat: true })}${seccionAudios(audios)}${await freshnessNote()}`;
   },
 
   async mensajes_recientes({ chat, minutos, solo_recibidos, limit }) {
@@ -1233,13 +1383,47 @@ const handlers = {
     );
   },
 
+  async transcribir_audios({ chat, desde, hasta, limit }) {
+    const max = clampLimit(limit, 5, 15);
+    const jid = chat ? await resolveChatJID(chat) : null;
+    const where = await commonFilters({ chat: jid, desde, hasta });
+    where.push(`m.message_type = 'audio'`);
+    const rows = await adjuntarTranscripciones(await selectMessages('messages m', where.join(' AND '), 'DESC', max));
+    if (!rows.length) return `No hay audios${chat ? ` en "${chat}"` : ''} en ese período.`;
+
+    const conArchivo = (r) => r.media_path && fs.existsSync(r.media_path);
+    const faltan = rows.filter((r) => r.transcripcion === undefined && conArchivo(r));
+    const sinArchivo = rows.filter((r) => r.transcripcion === undefined && !conArchivo(r));
+    const yaEstaban = rows.length - faltan.length - sinArchivo.length;
+
+    if (faltan.length) {
+      const res = await correrTranscriptor(whisperListo(), faltan.map((r) => ({
+        msg_id: r.message_id, chat_jid: r.chat_jid, chat_name: r.chat_name, sender_name: r.sender_name,
+        from_me: r.from_me, ts: r.ts, media_path: r.media_path,
+      })));
+      for (const r of faltan) {
+        const k = `${r.message_id}|${r.chat_jid}`;
+        if (k in res) r.transcripcion = res[k];
+      }
+    }
+
+    const nuevos = faltan.filter((r) => r.transcripcion !== undefined).length;
+    const notas = [];
+    if (yaEstaban) notas.push(`${yaEstaban} ya estaban transcriptos`);
+    if (nuevos) notas.push(`${nuevos} transcriptos ahora`);
+    if (sinArchivo.length) notas.push(`${sinArchivo.length} sin archivo en esta Mac (WhatsApp Desktop no los descargó; suelen ser anteriores a vincularlo)`);
+    rows.reverse();   // del más viejo al más nuevo, como se escucharían
+    return `${rows.length} audio(s)${chat ? ` en "${rows[0].chat_name || chat}"` : ''} — ${notas.join(', ')}.\n` +
+      `Ojo: es transcripción automática; los nombres propios pueden salir mal.\n\n${formatMessages(rows, { withChat: !chat })}`;
+  },
+
   async leer_chat({ chat, desde, hasta, limit }) {
     if (!chat) throw new Error('`chat` es obligatorio.');
     const jid = await resolveChatJID(chat);
     const where = await commonFilters({ chat: jid, desde, hasta });
     const clause = where.join(' AND ');
 
-    const rows = await selectMessages('messages m', clause, 'ASC', clampLimit(limit, 100, 1000));
+    const rows = await adjuntarTranscripciones(await selectMessages('messages m', clause, 'ASC', clampLimit(limit, 100, 1000)));
     const name = rows[0]?.chat_name || chat;
     return `${rows.length} mensaje(s) en "${name}" (${jid}), en orden cronológico:\n\n${formatMessages(rows, { withChat: false })}${await freshnessNote()}`;
   },

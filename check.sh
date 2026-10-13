@@ -123,6 +123,24 @@ if [ "$SOLO" = todo ] || [ "$SOLO" = sync ]; then
   echo
 fi
 
+# ---------------------------------------------------------------- audios
+if [ "$SOLO" = todo ] || [ "$SOLO" = audios ]; then
+  echo "══ Transcripción de audios ══"
+  T="$HOME/.wacrawl/transcripciones.sqlite"
+  if [ ! -f "$T" ]; then
+    echo "  no instalada (opcional: ./setup-whisper.sh)"
+  else
+    HECHOS=$("$WACRAWL" --db "$T" --sync never sql "SELECT count(*) FROM transcripciones" | tail -1)
+    VACIOS=$("$WACRAWL" --db "$T" --sync never sql "SELECT count(*) FROM transcripciones WHERE texto=''" | tail -1)
+    EN_DISCO=$("$WACRAWL" --sync never sql "SELECT count(DISTINCT msg_id) FROM messages WHERE message_type='audio' AND media_path<>''" | tail -1)
+    echo "  transcriptos: $HECHOS de ~$EN_DISCO audios en disco ($VACIOS sin voz detectable)"
+    ULT=$(grep -v Warning "$HOME/.wacrawl/transcribir.log" 2>/dev/null | grep -E "^transcriptos|^nada|^corte|^ya hay" | tail -1)
+    [ -n "$ULT" ] && echo "  última pasada: $ULT"
+    pgrep -f "transcribir.py --pendientes" >/dev/null && echo "  (hay una pasada corriendo ahora)"
+  fi
+  echo
+fi
+
 # ------------------------------------------------------------- atribución
 if [ "$SOLO" = todo ] || [ "$SOLO" = atribucion ]; then
   echo "══ Atribución de remitente ══"

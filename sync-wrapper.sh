@@ -111,6 +111,24 @@ else
   log "sync OK"
 fi
 
+# Transcripción de los audios nuevos, si está instalada (setup-whisper.sh).
+# Local y sin conexión; tope de 20 min por corrida para no eternizar el sync.
+# transcribir.py tiene su propio candado: si hay otra pasada corriendo, sale.
+REPO="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$REPO/whisper.env" ] && [ -f "$REPO/transcribir.py" ]; then
+  source "$REPO/whisper.env"
+  UV=""
+  for c in "$HOME/.local/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv "$HOME/.cargo/bin/uv"; do
+    [ -x "$c" ] && { UV="$c"; break; }
+  done
+  if [ -n "$UV" ] && [ -d "$HOME/.cache/huggingface/hub/models--${WHISPER_MODELO//\//--}" ]; then
+    RES=$(UV_OFFLINE=1 HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 WHISPER_MODELO="$WHISPER_MODELO" \
+      "$UV" run --quiet --python "$WHISPER_PYTHON" --with "$WHISPER_PAQUETE" \
+      python "$REPO/transcribir.py" --pendientes --minutos 20 2>&1 >/dev/null | grep -v Warning | tail -1)
+    log "audios: ${RES:-sin novedades}"
+  fi
+fi
+
 if AGE_H=$(data_age_hours); then
   log "antigüedad del dato: ${AGE_H}h"
   if [ "$AGE_H" -gt "$FRESH_LIMIT_H" ]; then

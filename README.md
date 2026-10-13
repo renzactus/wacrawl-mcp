@@ -13,6 +13,7 @@ Todo corre en tu computadora. Tus chats no se suben a ningún servidor (ver [Pri
 - *"¿Cuáles son mis últimos 5 chats? ¿Me contestó Ana?"*
 - *"Mostrame el PDF que me mandó Laura ayer"* — y lo lee de verdad.
 - *"Pasame a Descargas la foto del contrato que mandaron en el grupo."*
+- *"¿Qué me dijo Martín en el audio de ayer?"* — si instalás la [transcripción local](#notas-de-voz-opcional).
 - *"Prepará un follow-up para Pedro con lo que hablamos"* — te abre WhatsApp con el mensaje escrito; lo mandás vos.
 - *"Armá mensajes personalizados para estas 6 personas"* — te los va abriendo de a uno, a medida que mandás.
 
@@ -101,6 +102,28 @@ consultó. Lo recomendable es una cuenta por persona (un plan Team, por ejemplo)
 **Nunca envía nada.** Puede dejarte un mensaje escrito en WhatsApp, pero el que aprieta Enter sos
 vos. No hay forma de que mande algo solo.
 
+## Notas de voz (opcional)
+
+Transcribe tus audios **en tu Mac, sin mandarlos a nadie**, con Whisper (el mismo tipo de modelo que
+usan los servicios pagos). Después Claude los lee como texto y **los encuentra en las búsquedas**:
+*"¿en qué audio me hablaron del precio?"* funciona.
+
+```bash
+~/wacrawl-mcp/setup-whisper.sh
+```
+
+- Necesita una Mac con **chip Apple** (M1 o posterior). Baja el modelo una vez (~1,6 GB).
+- Transcribe todos los audios que tengas en disco en segundo plano (≈2 s por audio, sin frenar la
+  Mac: trabaja el chip gráfico), y después los nuevos en cada sync automático.
+- Si pedís un audio que todavía no se procesó, Claude lo transcribe en el momento.
+- Transcribe de a ~13-17 veces la duración real: un audio de 1 minuto, unos 4 segundos.
+
+**Calidad:** muy buena con español rioplatense. El punto débil son los **nombres propios y las
+palabras en inglés**. Para mejorarlo, escribí los nombres que más usás (personas, empresas, lugares)
+en `~/.wacrawl/vocabulario.txt`, uno por línea o separados por coma.
+
+Sólo transcribe audios que estén en tu Mac (los que WhatsApp Desktop descargó desde que lo vinculaste).
+
 ## Mandar mensajes (borradores)
 
 Claude no envía: **abre WhatsApp en el chat con el mensaje escrito** y vos lo revisás y mandás.
@@ -136,7 +159,7 @@ Claves: `porMinuto`, `porHora`, `largoMax`, `antiDifusion`, `colaMax`, `colaEspe
   nombre de la gente que no tenés agendada. Los chats individuales no tienen este problema.
 - **Sólo hay archivos (fotos, PDFs) desde que vinculaste WhatsApp Desktop.** Los de antes nunca se
   bajaron a la Mac.
-- **No transcribe audios**: sabe que existen, no qué dicen.
+- **Los audios se transcriben sólo si instalás la [transcripción local](#notas-de-voz-opcional)**; si no, sabe que existen pero no qué dicen.
 - **Para preparar un mensaje necesita el número de teléfono.** Funciona con tus contactos agendados;
   para gente no agendada WhatsApp oculta el número, y tenés que pasárselo vos.
 - Si alguien está agendado con un apodo, buscalo por cómo lo tenés agendado.
@@ -147,6 +170,7 @@ Claves: `porMinuto`, `porHora`, `largoMax`, `antiDifusion`, `colaMax`, `colaEspe
 |---|---|
 | No aparece en Claude | Cerrá con **⌘Q**, corré `register.sh`, abrí. Si lo registraste con Claude abierto, se borró al cerrar. |
 | macOS pregunta *"node would like to access data from other apps"* cada vez | Falta el paso 2 (o se le dio el permiso a otro node). Tiene que ser la ruta que termina en `/runtime/bin/node`. |
+| Un audio aparece como "(audio)" sin texto | Todavía no se transcribió (la primera pasada tarda horas) o no está instalada: `check.sh audios`. Pedile a Claude que lo transcriba. |
 | La cola no pasa al siguiente | Necesita el permiso del paso 2 para detectar que mandaste. Pedile *"estado de la cola"*: te dice por qué se pausó. |
 | Las respuestas parecen viejas | `check.sh` → sección "Salud del sync". El sync se repara solo si WhatsApp renumeró su base; si no, te avisa con una notificación. |
 | "No encontré ningún chat" con alguien que sí tenés | Está agendado con otro nombre o un apodo. Decile cómo lo tenés agendado. |

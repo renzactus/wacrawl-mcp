@@ -133,3 +133,6 @@ fi
 echo
 echo " Para probar, preguntale: \"¿cuáles son mis últimos 3 chats de WhatsApp?\""
 echo " Si algo no anda: $REPO/check.sh"
+echo
+echo " Opcional — transcribir notas de voz en tu Mac (sin mandarlas a nadie):"
+echo "   $REPO/setup-whisper.sh"

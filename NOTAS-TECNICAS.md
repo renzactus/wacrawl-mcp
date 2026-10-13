@@ -34,6 +34,7 @@ esquema CoreData de WhatsApp, se rompe sólo lo que lee en vivo y el histórico 
 | `exportar_archivo` | archivo + `~/.wacrawl/media` | copia un adjunto a una carpeta normal |
 | `preparar_mensaje` | abre WhatsApp | un borrador sin enviar |
 | `cola_mensajes` | abre WhatsApp + en vivo | varios borradores, de a uno, a medida que se mandan |
+| `transcribir_audios` | archivo + Whisper local | transcribe en el momento audios que todavía no tienen texto |
 
 Las tools del archivo comparan contra WhatsApp en vivo (`wacrawl doctor`, ~1 s) y avisan si el
 archivo quedó atrás.
@@ -49,6 +50,9 @@ archivo quedó atrás.
 | `sync-wrapper.sh` | lo que corre launchd cada 6 h: sync + auto-recuperación + avisos |
 | `register.sh` | agrega el server a la config de Claude Desktop |
 | `check.sh` | diagnóstico de fidelidad |
+| `transcribir.py` | transcripción con Whisper/MLX (`--pendientes` o lista por `--stdin`) |
+| `setup-whisper.sh` | instala uv, Python gestionado y el modelo; prueba y arranca la pasada inicial |
+| `whisper.env` | versiones de Python, librería y modelo: única fuente de verdad |
 
 ## Permisos de macOS
 
@@ -143,6 +147,28 @@ Dos defensas:
   consulta), y no con un timer.
 - Las barreras viven en código y sus contadores en disco (`~/.wacrawl/borradores.jsonl`): un modelo
   desbocado ignora instrucciones pero no un `if`, y reiniciar no las resetea.
+
+**Transcripción de audios**
+
+- Whisper `large-v3-turbo` sobre MLX (`mlx-whisper`), corrido con `uv run --with` para no compilar
+  nada. Medido en un M4: 13-17x tiempo real; ~5 s de carga del modelo por proceso.
+- Las transcripciones van a una base **aparte** (`~/.wacrawl/transcripciones.sqlite`, clave
+  `msg_id + chat_jid`): el archivo de wacrawl nunca se escribe. El server las lee con
+  `wacrawl --db … sql`, así funciona con cualquier versión de Node (sin `node:sqlite`).
+- **Sin red al transcribir**: `HF_HUB_OFFLINE=1`, `UV_OFFLINE=1`, telemetría apagada. La red se usa
+  sólo en `setup-whisper.sh` para bajar el modelo.
+- **Python gestionado por uv** (`uv python install`), no el del sistema: Claude Desktop y launchd
+  corren con un PATH mínimo, y con el Python de Homebrew `uv` no encontraba intérprete.
+- El audio se pasa a WAV con `afconvert` (nativo, lee el Opus de WhatsApp: no hace falta ffmpeg) y
+  se carga con `wave`. Se le pone extensión por symlink porque wacrawl 0.4.x guarda sin extensión.
+- Base en **WAL** para que el server lea mientras se escribe. Las pasadas en segundo plano
+  (`--pendientes`) tienen candado (`flock`) entre sí; un pedido desde Claude (`--stdin`) **no** lo
+  espera — si la pasada inicial lo tiene una hora, Claude se colgaría hasta el timeout. Pueden correr
+  en paralelo; en el peor caso se transcribe dos veces lo mismo (`INSERT OR REPLACE`).
+- Anti-alucinaciones: se descartan segmentos con `no_speech_prob > 0.6` y `avg_logprob < -1`, y las
+  frases de subtítulos de YouTube que Whisper inventa ante silencio ("Subtítulos realizados por la
+  comunidad de Amara.org"). `condition_on_previous_text=False` evita que un error se arrastre.
+- Pista (`initial_prompt`): el nombre del chat más `~/.wacrawl/vocabulario.txt`. Ayuda con nombres.
 
 **Los PDF se renderizan a imagen con `sips`**, no se les extrae el texto: macOS no trae nada nativo
 para extraerlo (Spotlight no indexa el container de WhatsApp, PyObjC no está), y renderizar sirve
