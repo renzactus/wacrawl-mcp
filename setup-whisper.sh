@@ -48,10 +48,28 @@ snapshot_download('$WHISPER_MODELO')" 2>&1 | grep -v Warning || true
 [ -d "$HOME/.cache/huggingface/hub/models--${WHISPER_MODELO//\//--}" ] || falla "No se pudo bajar el modelo."
 ok "modelo listo"
 
-echo; echo "▸ Prueba: un audio, sin conexión"
-RES=$(env -i HOME="$HOME" PATH=/usr/bin:/bin UV_OFFLINE=1 HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 WHISPER_MODELO="$WHISPER_MODELO" \
-  "$UV" run --quiet --python "$WHISPER_PYTHON" --with "$WHISPER_PAQUETE" python "$REPO/transcribir.py" --pendientes --limite 1 2>&1 | grep -v Warning || true)
-[[ "$RES" == *'"texto"'* || "$RES" == *"nada para transcribir"* ]] || falla "La prueba falló: $(echo "$RES" | tail -2)"
+echo; echo "▸ Vocabulario (ayuda a acertar nombres propios)"
+VOC="$HOME/.wacrawl/vocabulario.txt"
+if [ -f "$VOC" ]; then
+  ok "ya tenés uno ($(grep -cvE '^[[:space:]]*(#|$)' "$VOC") términos) — no lo toco"
+else
+  env -i HOME="$HOME" PATH=/usr/bin:/bin UV_OFFLINE=1 HF_HUB_OFFLINE=1 \
+    "$UV" run --quiet --python "$WHISPER_PYTHON" --with "$WHISPER_PAQUETE" python "$REPO/transcribir.py" --vocabulario-base \
+    2>/dev/null > "$VOC" || true
+  ok "armé uno sugerido desde lo que escribís: $VOC"
+  echo "    Revisalo: agregá arriba tu empresa, equipo y clientes (lo primero pesa más)."
+  echo "    Medido: con vocabulario, el nombre de una empresa pasó de salir bien 0 a 11 veces de 20."
+fi
+
+echo; echo "▸ Prueba: los 3 audios más recientes, sin conexión"
+# En una base temporal: no depende de qué haya pendiente (podría ser justo un
+# audio dañado) ni escribe en la base real. Pasa si al menos uno sale bien.
+PRUEBA="$(mktemp -d)"
+RES=$(env -i HOME="$HOME" PATH=/usr/bin:/bin UV_OFFLINE=1 HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
+  WHISPER_MODELO="$WHISPER_MODELO" WACRAWL_TRANSCRIPCIONES="$PRUEBA/t.sqlite" \
+  "$UV" run --quiet --python "$WHISPER_PYTHON" --with "$WHISPER_PAQUETE" python "$REPO/transcribir.py" --pendientes --limite 3 2>&1 | grep -v Warning || true)
+rm -rf "$PRUEBA"
+[[ "$RES" == *'"texto"'* ]] || falla "La prueba falló: $(echo "$RES" | tail -2)"
 ok "$(echo "$RES" | grep -o '"texto": "[^"]*' | head -1 | cut -c11-90)…"
 
 echo; echo "▸ Pasada inicial"
@@ -64,4 +82,5 @@ nohup env -i HOME="$HOME" PATH=/usr/bin:/bin UV_OFFLINE=1 HF_HUB_OFFLINE=1 HF_HU
 ok "arrancó (registro: ~/.wacrawl/transcribir.log)"
 echo
 echo "Listo. Cerrá y abrí Claude Desktop (⌘Q) para que tome la tool de audios."
-echo "Tip: si querés que acierte nombres propios, poné palabras en ~/.wacrawl/vocabulario.txt"
+echo "Si después editás el vocabulario, re-transcribí lo viejo con:"
+echo "  $REPO/rehacer-transcripciones.sh"

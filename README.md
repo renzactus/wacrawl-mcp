@@ -118,9 +118,25 @@ usan los servicios pagos). Después Claude los lee como texto y **los encuentra 
 - Si pedís un audio que todavía no se procesó, Claude lo transcribe en el momento.
 - Transcribe de a ~13-17 veces la duración real: un audio de 1 minuto, unos 4 segundos.
 
-**Calidad:** muy buena con español rioplatense. El punto débil son los **nombres propios y las
-palabras en inglés**. Para mejorarlo, escribí los nombres que más usás (personas, empresas, lugares)
-en `~/.wacrawl/vocabulario.txt`, uno por línea o separados por coma.
+**Calidad:** muy buena con español rioplatense. El punto débil son los **nombres propios poco
+comunes** — sobre todo el de tu empresa, si no es una palabra del diccionario. Medido sin ayuda, un
+nombre de empresa salió bien sólo 1 de cada 4 veces (y Zapia comete el mismo error). Eso importa más
+para **buscar** que para entender: Claude deduce que "Lucio" es Lucho al leer, pero una búsqueda
+por "Lucho" nunca encuentra ese audio.
+
+Para eso está el **vocabulario** (`~/.wacrawl/vocabulario.txt`): una lista, por prioridad, de los
+nombres que usás. No entrena nada — es una pista que se le da a Whisper en cada audio. El instalador
+te arma uno sugerido a partir de lo que escribís en WhatsApp; **revisalo y poné arriba tu empresa,
+equipo y clientes**. En los grupos, además, se suman solos los nombres de quienes más hablan ahí.
+
+Medido con vocabulario, en 20 audios donde el nombre de la empresa salía mal: **de 0 a 11 bien**, y en
+otros 8, un apodo **de 1 a 7**; sin inventar nombres en audios donde no se dijeron, y sin ser más lento.
+
+Si editás el vocabulario, re-transcribí lo viejo (en segundo plano, retoma si se corta):
+
+```bash
+~/wacrawl-mcp/rehacer-transcripciones.sh
+```
 
 Sólo transcribe audios que estén en tu Mac (los que WhatsApp Desktop descargó desde que lo vinculaste).
 

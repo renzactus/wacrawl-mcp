@@ -52,6 +52,7 @@ archivo quedó atrás.
 | `check.sh` | diagnóstico de fidelidad |
 | `transcribir.py` | transcripción con Whisper/MLX (`--pendientes` o lista por `--stdin`) |
 | `setup-whisper.sh` | instala uv, Python gestionado y el modelo; prueba y arranca la pasada inicial |
+| `rehacer-transcripciones.sh` | re-transcribe en segundo plano lo hecho con otro vocabulario |
 | `whisper.env` | versiones de Python, librería y modelo: única fuente de verdad |
 
 ## Permisos de macOS
@@ -168,7 +169,20 @@ Dos defensas:
 - Anti-alucinaciones: se descartan segmentos con `no_speech_prob > 0.6` y `avg_logprob < -1`, y las
   frases de subtítulos de YouTube que Whisper inventa ante silencio ("Subtítulos realizados por la
   comunidad de Amara.org"). `condition_on_previous_text=False` evita que un error se arrastre.
-- Pista (`initial_prompt`): el nombre del chat más `~/.wacrawl/vocabulario.txt`. Ayuda con nombres.
+- **Vocabulario** (`initial_prompt`): nombre del chat + en grupos, los 6 que más hablan (desde el
+  archivo, sin emojis) + `~/.wacrawl/vocabulario.txt` por prioridad. **Whisper usa como mucho ~223
+  tokens de pista y, si se pasa, descarta el PRINCIPIO**: por eso se arma término a término contando
+  tokens con el tokenizer de Whisper y se corta en 180, por el final.
+- Medido (A/B sobre los mismos audios): nombre de la empresa bien 0 → 11 de 20; apodo 1 → 7 de 8;
+  12 audios al azar sin nombres inventados; velocidad igual (15,3x). El riesgo conocido del prompt
+  es que induzca palabras en silencios: no apareció, y el filtro de `no_speech_prob` ayuda.
+- Cada transcripción guarda `modelo = <modelo>|voc:<sha1 del vocabulario>`. `--rehacer` sólo vuelve
+  a hacer las que tienen otra huella: se puede cortar y retomar, y editar el vocabulario no obliga a
+  rehacer lo que ya estaba al día.
+- `--vocabulario-base` sugiere uno desde los mensajes de **texto propios** (nombres en mayúscula a
+  mitad de oración + apodos de los chats más activos). Excluye lo que empieza con `_`: **Zapia publica
+  sus transcripciones como mensajes propios en cursiva**, con los mismos errores ("Viatic"), y sin ese
+  filtro el error entraba al vocabulario.
 
 **Los PDF se renderizan a imagen con `sips`**, no se les extrae el texto: macOS no trae nada nativo
 para extraerlo (Spotlight no indexa el container de WhatsApp, PyObjC no está), y renderizar sirve
