@@ -119,8 +119,10 @@ Dos defensas:
 
 **Base viva de WhatsApp**
 
-- `ZWAMESSAGE`, `ZWACHATSESSION`, `ZWAGROUPMEMBER`, `ZWAMEDIAITEM`. `ZTITLE` es el texto que
-  acompaña al archivo, **no** su nombre; el nombre original no se guarda.
+- `ZWAMESSAGE`, `ZWACHATSESSION`, `ZWAGROUPMEMBER`, `ZWAMEDIAITEM`. En **documentos**, `ZWAMESSAGE.ZTEXT`
+  es el **nombre original del archivo** y `ZWAMEDIAITEM.ZTITLE` el texto que lo acompaña (en el
+  archivo de wacrawl: `text` y `media_title`). `ZMEDIALOCALPATH` es relativo a `<container>/Message/`.
+- `ZMESSAGETYPE`: 1 imagen, 2 video, 3 audio, 8 documento, 11 gif, 15 sticker, 7 miniatura de link.
 - **Un chat nuevo se crea con `ZCONTACTJID = <x>@lid` y el teléfono en `ZCONTACTIDENTIFIER`.**
   Buscar sólo por `ZCONTACTJID` hacía que la cola nunca detectara el envío a números nuevos.
 - `LID.sqlite` (`ZWAPHONENUMBERLIDPAIR`) estaba vacía: para los `@lid` de gente no agendada no hay
@@ -183,6 +185,21 @@ Dos defensas:
   mitad de oración + apodos de los chats más activos). Excluye lo que empieza con `_`: **Zapia publica
   sus transcripciones como mensajes propios en cursiva**, con los mismos errores ("Viatic"), y sin ese
   filtro el error entraba al vocabulario.
+
+**Adjuntos recién llegados**
+
+- `ver_archivos` y `exportar_archivo` buscan en el archivo **y** en WhatsApp en vivo (`buscarAdjuntos`),
+  unidos por id de mensaje. Antes sólo miraban el archivo: un documento recibido hace un rato existía
+  en la Mac pero no ahí, y "el docx de la gacetilla" devolvía el último PDF que sí estaba — otro
+  archivo, más viejo, sin avisar. Si existen las dos copias se usa la del archivo (no requiere permiso).
+- Un chat nuevo puede no estar todavía en el archivo: si `resolveChatJID` no lo encuentra, se busca
+  por nombre en vivo (`ZPARTNERNAME`).
+- `exportar_archivo` guarda los documentos con su nombre original y pide verificar fecha/chat/nombre.
+- **Word/RTF/OpenDocument se leen como texto con `textutil`** (nativo). Decide el formato por la
+  extensión, así que se copia con la que corresponde (wacrawl 0.4.x guarda sin extensión). Tope de
+  20.000 caracteres; Excel no está soportado (se exporta).
+- `mensajes_recientes` marca los adjuntos: un documento trae su nombre en `ZTEXT` y sin marcar parecía
+  un mensaje de texto.
 
 **Los PDF se renderizan a imagen con `sips`**, no se les extrae el texto: macOS no trae nada nativo
 para extraerlo (Spotlight no indexa el container de WhatsApp, PyObjC no está), y renderizar sirve

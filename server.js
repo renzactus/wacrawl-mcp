@@ -178,6 +178,30 @@ async function renderToJpeg(srcPath) {
 
 const EXT_SOPORTADAS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.heic', '.gif', '.pdf', '.tiff', '.bmp']);
 
+/** Documentos que se pueden LEER como texto con textutil (viene con macOS, sin dependencias). */
+const EXT_TEXTO = new Set(['.docx', '.doc', '.rtf', '.odt', '.txt', '.html', '.htm']);
+const MAX_TEXTO = 20000;
+
+async function textoDeDocumento(srcPath) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wacrawl-doc-'));
+  try {
+    // textutil decide el formato por la extensión: wacrawl 0.4.x guarda sin extensión.
+    const ext = extensionDe(srcPath);
+    const entrada = path.join(dir, `in${ext}`);
+    fs.copyFileSync(srcPath, entrada);
+    const texto = await new Promise((resolve, reject) => {
+      execFile('/usr/bin/textutil', ['-convert', 'txt', '-stdout', entrada], { maxBuffer: MAX_BUFFER, timeout: 30000 },
+        (err, out, stderr) => (err ? reject(new Error((stderr || err.message).toString().trim())) : resolve(out.toString())));
+    });
+    const limpio = texto.replace(/\n{3,}/g, '\n\n').trim();
+    return limpio.length > MAX_TEXTO
+      ? `${limpio.slice(0, MAX_TEXTO)}\n\n[… recortado: el documento sigue. Exportalo con exportar_archivo para tenerlo completo.]`
+      : limpio;
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* no importa */ }
+  }
+}
+
 /**
  * Extensión real de un adjunto. wacrawl 0.3.x copiaba la media con su nombre
  * original (".../uuid.jpg"), pero 0.4.x la guarda por hash y SIN extensión
@@ -598,6 +622,108 @@ function correrTranscriptor({ uv, script }, items) {
 }
 
 /* ------------------------------------------------------------------ */
+/* adjuntos: archivo histórico + WhatsApp en vivo                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * El archivo histórico se actualiza cada 6 h: un documento que llegó hace un
+ * rato existe en la Mac (WhatsApp lo descarga solo) pero todavía no está ahí.
+ * Antes, ver/exportar sólo miraban el archivo, así que pedir "el docx que me
+ * mandaron recién" devolvía el último que sí estaba — otro archivo, más viejo.
+ * Ahora se buscan los dos lados y se unen por id de mensaje.
+ *
+ * En la base viva: ZMESSAGETYPE 1 imagen, 2 video, 3 audio, 8 documento,
+ * 11 gif, 15 sticker (7 son miniaturas de links: se ignoran). Para documentos,
+ * ZTEXT es el NOMBRE ORIGINAL del archivo y ZTITLE el texto que lo acompaña.
+ * ZMEDIALOCALPATH es relativo a <container>/Message/.
+ */
+const TIPO_VIVO = { 1: 'image', 2: 'video', 3: 'audio', 8: 'document', 11: 'gif', 15: 'sticker' };
+const CODIGO_VIVO = Object.fromEntries(Object.entries(TIPO_VIVO).map(([k, v]) => [v, Number(k)]));
+
+async function adjuntosEnVivo({ jid, chatTexto, tipos, contiene, desde, hasta, limite }) {
+  const container = path.dirname(await sourcePath());
+  const w = ["mi.ZMEDIALOCALPATH IS NOT NULL", "mi.ZMEDIALOCALPATH <> ''"];
+  const codigos = tipos.map((t) => CODIGO_VIVO[t]).filter(Boolean);
+  w.push(`m.ZMESSAGETYPE IN (${codigos.join(', ')})`);
+  if (jid) w.push(`(s.ZCONTACTJID = ${sqlString(jid)} OR s.ZCONTACTIDENTIFIER = ${sqlString(jid)})`);
+  else if (chatTexto) w.push(`lower(s.ZPARTNERNAME) LIKE ${sqlString(`%${likeLiteral(chatTexto.toLowerCase())}%`)} ESCAPE '\\'`);
+  if (contiene) {
+    w.push(`lower(coalesce(m.ZTEXT, '') || ' ' || coalesce(mi.ZTITLE, '')) LIKE ${sqlString(`%${likeLiteral(String(contiene).toLowerCase())}%`)} ESCAPE '\\'`);
+  }
+  if (desde) w.push(`m.ZMESSAGEDATE >= ${toEpoch(desde, 'desde') - APPLE_EPOCH}`);
+  if (hasta) w.push(`m.ZMESSAGEDATE < ${toEpoch(hasta, 'hasta') - APPLE_EPOCH}`);
+  const filas = await runLiveSQL(
+    `SELECT m.ZSTANZAID AS message_id, CAST(m.ZMESSAGEDATE + ${APPLE_EPOCH} AS INTEGER) AS ts,` +
+    ` strftime('%Y-%m-%d %H:%M', m.ZMESSAGEDATE + ${APPLE_EPOCH}, 'unixepoch', 'localtime') AS timestamp,` +
+    ` m.ZISFROMME AS from_me, m.ZMESSAGETYPE AS codigo, m.ZTEXT AS text, mi.ZTITLE AS media_title,` +
+    ` mi.ZMEDIALOCALPATH AS ruta_rel, s.ZPARTNERNAME AS chat_name, s.ZCONTACTJID AS chat_jid,` +
+    ` gm.ZCONTACTNAME AS member_name, gm.ZMEMBERJID AS member_jid` +
+    ` FROM ZWAMESSAGE m JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM` +
+    ` JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER` +
+    ` WHERE ${w.join(' AND ')} ORDER BY m.ZMESSAGEDATE DESC LIMIT ${limite}`
+  );
+  return filas.map((f) => ({
+    message_id: f.message_id, ts: f.ts, timestamp: f.timestamp, from_me: f.from_me,
+    message_type: TIPO_VIVO[f.codigo], text: f.text, media_title: f.media_title,
+    media_path: path.join(container, 'Message', f.ruta_rel),
+    chat_name: f.chat_name, chat_jid: f.chat_jid,
+    // senderLabel: en un grupo, el miembro; en un DM, la contraparte del chat
+    sender_name: f.member_name || null, sender_jid: f.member_jid || f.chat_jid,
+  }));
+}
+
+/** Adjuntos del archivo histórico Y de WhatsApp en vivo, unidos, del más nuevo al más viejo. */
+async function buscarAdjuntos({ chat, tipos, contiene, desde, hasta, limite }) {
+  let jid = null;
+  let chatTexto = null;
+  if (chat) {
+    try {
+      jid = await resolveChatJID(chat);
+    } catch (err) {
+      // Un chat nuevo puede no estar todavía en el archivo: se busca por nombre en vivo.
+      if (!/No encontré/.test(err.message)) throw err;
+      chatTexto = String(chat).trim();
+    }
+  }
+
+  let archivo = [];
+  if (!chatTexto) {
+    const where = await commonFilters({ chat: jid, desde, hasta });
+    where.push(`m.media_path IS NOT NULL AND m.media_path <> ''`);
+    where.push(`m.message_type IN (${tipos.map(sqlString).join(', ')})`);
+    if (contiene) {
+      const c = sqlString(`%${likeLiteral(String(contiene).toLowerCase())}%`);
+      where.push(`(lower(coalesce(m.text, '')) LIKE ${c} ESCAPE '\\' OR lower(coalesce(m.media_title, '')) LIKE ${c} ESCAPE '\\')`);
+    }
+    archivo = await selectMessages('messages m', where.join(' AND '), 'DESC', limite);
+  }
+
+  let vivo = [];
+  let avisoVivo = null;
+  try {
+    vivo = await adjuntosEnVivo({ jid, chatTexto, tipos, contiene, desde, hasta, limite });
+  } catch (err) {
+    avisoVivo = `No pude mirar WhatsApp en vivo (${err.message.slice(0, 100)}): puede faltar lo que llegó en las últimas horas.`;
+  }
+
+  // Si el archivo tiene su copia en disco, se usa esa (no depende de permisos de macOS).
+  const porId = new Map(vivo.map((r) => [r.message_id, r]));
+  for (const r of archivo) {
+    if (r.media_path && fs.existsSync(r.media_path)) porId.set(r.message_id, r);
+    else if (!porId.has(r.message_id)) porId.set(r.message_id, r);
+  }
+  const filas = [...porId.values()].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return { filas, avisoVivo, chatNoEncontrado: chatTexto && !filas.length ? chatTexto : null };
+}
+
+/** Nombre original de un documento (WhatsApp lo guarda), o null si no es un nombre de archivo. */
+function nombreOriginal(m) {
+  const t = String(m.text || '').trim();
+  if (m.message_type !== 'document' || !t || looksLikeBlob(t) || t.length > 150) return null;
+  return /\.[A-Za-z0-9]{2,5}$/.test(t) ? t : null;
+}
+
+/* ------------------------------------------------------------------ */
 /* SQL helpers                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -920,12 +1046,13 @@ const TOOLS = [
   {
     name: 'ver_archivos',
     description:
-      'Muestra las imágenes y documentos que se mandaron en un chat, para poder MIRARLOS (no sólo saber que existen). Los PDF se ven como imagen de su primera página. Ojo: WhatsApp Desktop sólo guarda media en esta Mac desde el 2026-08-06; de antes no hay archivos, aunque el mensaje exista.',
+      'Muestra las imágenes y documentos que se mandaron en un chat, para poder MIRARLOS o LEERLOS (no sólo saber que existen). Word, RTF, OpenDocument y texto se devuelven como texto completo. Los PDF se ven como imagen de su primera página. Incluye lo que llegó hace minutos (mira WhatsApp en vivo, no sólo el archivo). Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac.',
     inputSchema: {
       type: 'object',
       properties: {
         chat: { type: 'string', description: 'Opcional: limitar a un chat, por nombre o por JID.' },
         tipo: { type: 'string', enum: ['imagen', 'documento', 'todos'], description: 'Qué traer. Default: todos.' },
+        contiene: { type: 'string', description: 'Opcional: parte del nombre del archivo o del texto que lo acompaña.' },
         desde: { type: 'string', description: 'Opcional: sólo posteriores. YYYY-MM-DD o RFC3339.' },
         hasta: { type: 'string', description: 'Opcional: sólo anteriores. YYYY-MM-DD o RFC3339.' },
         limit: { type: 'integer', description: 'Máximo de archivos (default 3, máx 10). Son imágenes: pedí pocas.' },
@@ -935,12 +1062,12 @@ const TOOLS = [
   {
     name: 'exportar_archivo',
     description:
-      'Copia un adjunto de WhatsApp a una carpeta normal (por defecto ~/Downloads) y devuelve la ruta, para poder USARLO: subirlo, adjuntarlo, mandarlo a otra herramienta. Distinto de ver_archivos, que sólo permite mirarlo. Sirve para cualquier tipo de archivo, también los que no se pueden mostrar (videos, audios, planillas).',
+      'Copia un adjunto de WhatsApp a una carpeta normal (por defecto ~/Downloads), con su nombre original si es un documento, y devuelve la ruta, para poder USARLO. Incluye lo que llegó hace minutos (mira WhatsApp en vivo): subirlo, adjuntarlo, mandarlo a otra herramienta. Distinto de ver_archivos, que sólo permite mirarlo. Sirve para cualquier tipo de archivo, también los que no se pueden mostrar (videos, audios, planillas).',
     inputSchema: {
       type: 'object',
       properties: {
         chat: { type: 'string', description: 'Opcional: limitar a un chat, por nombre o por JID.' },
-        contiene: { type: 'string', description: 'Opcional: texto que acompaña al archivo, para encontrar uno puntual.' },
+        contiene: { type: 'string', description: 'Opcional: parte del NOMBRE del archivo (ej. "gacetilla") o del texto que lo acompaña.' },
         tipo: {
           type: 'string',
           enum: ['imagen', 'documento', 'audio', 'video', 'todos'],
@@ -1093,7 +1220,8 @@ const handlers = {
   async mensajes_recientes({ chat, minutos, solo_recibidos, limit }) {
     const max = clampLimit(limit, 30, 200);
 
-    const where = ['m.ZTEXT IS NOT NULL'];
+    // Texto, o adjuntos (imagen, video, audio, documento) aunque no tengan texto.
+    const where = ['(m.ZTEXT IS NOT NULL OR m.ZMESSAGETYPE IN (1, 2, 3, 8))'];
     if (chat) {
       where.push(`lower(cs.ZPARTNERNAME) LIKE ${sqlString(`%${likeLiteral(String(chat).toLowerCase())}%`)} ESCAPE '\\'`);
     }
@@ -1107,7 +1235,7 @@ const handlers = {
       `SELECT strftime('%Y-%m-%d %H:%M', m.ZMESSAGEDATE + ${APPLE_EPOCH}, 'unixepoch', 'localtime') AS timestamp,` +
       ` cs.ZPARTNERNAME AS chat_name, m.ZISFROMME AS from_me,` +
       ` gm.ZCONTACTNAME AS member_name, gm.ZMEMBERJID AS member_jid,` +
-      ` m.ZPUSHNAME AS push_name, m.ZFROMJID AS sender_jid, m.ZTEXT AS text` +
+      ` m.ZPUSHNAME AS push_name, m.ZFROMJID AS sender_jid, m.ZTEXT AS text, m.ZMESSAGETYPE AS codigo` +
       ` FROM ZWAMESSAGE m` +
       ` LEFT JOIN ZWACHATSESSION cs ON cs.Z_PK = m.ZCHATSESSION` +
       ` LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER` +
@@ -1129,8 +1257,13 @@ const handlers = {
       else if (m.member_jid) quien = `(no identificado · ${m.member_jid})`;
       else if (m.push_name && !looksLikeBlob(m.push_name)) quien = m.push_name;
       else quien = donde;
-      const texto = String(m.text).trim();
-      return `${cuando} [${donde}] ${quien}: ${looksLikeBlob(texto) ? '(archivo adjunto)' : texto}`;
+      const texto = String(m.text || '').trim();
+      const legible = texto && !looksLikeBlob(texto) ? texto : '';
+      // Un documento trae su nombre en ZTEXT: sin esto parecía un mensaje de texto.
+      const tipo = { 1: 'imagen', 2: 'video', 3: 'audio', 8: 'documento' }[m.codigo];
+      const cuerpo = tipo === 'documento' ? `(documento: ${legible || 'sin nombre'} — se puede ver/exportar)`
+        : tipo ? `(${tipo})${legible ? ' ' + legible : ''}` : (legible || '(archivo adjunto)');
+      return `${cuando} [${donde}] ${quien}: ${cuerpo}`;
     });
 
     return (
@@ -1140,15 +1273,11 @@ const handlers = {
     );
   },
 
-  async ver_archivos({ chat, tipo, desde, hasta, limit }) {
+  async ver_archivos({ chat, tipo, contiene, desde, hasta, limit }) {
     const max = clampLimit(limit, 3, 10);
     const tipos = tipo === 'imagen' ? ['image'] : tipo === 'documento' ? ['document'] : ['image', 'document'];
-
-    const where = await commonFilters({ chat, desde, hasta });
-    where.push(`m.media_path IS NOT NULL AND m.media_path <> ''`);
-    where.push(`m.message_type IN (${tipos.map(sqlString).join(', ')})`);
-
-    const rows = await selectMessages('messages m', where.join(' AND '), 'DESC', max * 3);
+    const { filas: rows, avisoVivo, chatNoEncontrado } = await buscarAdjuntos({ chat, tipos, contiene, desde, hasta, limite: max * 3 });
+    if (chatNoEncontrado) throw new Error(`No encontré ningún chat que coincida con "${chatNoEncontrado}", ni en el archivo ni en WhatsApp en vivo.`);
 
     const content = [];
     let mostrados = 0;
@@ -1162,6 +1291,20 @@ const handlers = {
         continue;
       }
       const ext = extensionDe(ruta);
+      if (EXT_TEXTO.has(ext)) {
+        try {
+          const texto = await textoDeDocumento(ruta);
+          const nombre = nombreOriginal(m) ? ` «${nombreOriginal(m)}»` : '';
+          content.push({
+            type: 'text',
+            text: `${m.timestamp} [${m.chat_name || m.chat_jid}] ${senderLabel(m)} — documento${nombre}, texto completo:\n\n${texto || '(el documento no tiene texto)'}\n\n— fin del documento —`,
+          });
+          mostrados += 1;
+        } catch (err) {
+          problemas.push(`${m.timestamp} ${m.chat_name}: no se pudo leer el ${ext} (${err.message.slice(0, 80)})`);
+        }
+        continue;
+      }
       if (!EXT_SOPORTADAS.has(ext)) {
         problemas.push(`${m.timestamp} ${m.chat_name}: ${ext || 'formato desconocido'} no se puede mostrar (usá exportar_archivo)`);
         continue;
@@ -1169,10 +1312,11 @@ const handlers = {
       try {
         const data = await renderToJpeg(ruta);
         const que = m.message_type === 'document' ? 'documento (primera página)' : 'imagen';
-        const titulo = m.media_title && !looksLikeBlob(m.media_title) ? ` — ${m.media_title}` : '';
+        const nombre = nombreOriginal(m) ? ` «${nombreOriginal(m)}»` : '';
+        const titulo = m.media_title && !looksLikeBlob(m.media_title) ? ` — "${String(m.media_title).trim().slice(0, 120)}"` : '';
         content.push({
           type: 'text',
-          text: `${m.timestamp} [${m.chat_name || m.chat_jid}] ${senderLabel(m)} — ${que}${titulo}`,
+          text: `${m.timestamp} [${m.chat_name || m.chat_jid}] ${senderLabel(m)} — ${que}${nombre}${titulo}`,
         });
         content.push({ type: 'image', data, mimeType: 'image/jpeg' });
         mostrados += 1;
@@ -1182,10 +1326,10 @@ const handlers = {
     }
 
     if (mostrados === 0) {
-      const detalle = problemas.length ? `\n\n${problemas.join('\n')}` : '';
+      const detalle = (problemas.length ? `\n\n${problemas.join('\n')}` : '') + (avisoVivo ? `\n\n${avisoVivo}` : '');
       return (
         `No hay archivos para mostrar${chat ? ` en "${chat}"` : ''}.` +
-        ` Recordá que WhatsApp Desktop sólo guarda media en esta Mac desde el 2026-08-06;` +
+        ` Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac;` +
         ` de mensajes anteriores existe el registro pero no el archivo.${detalle}`
       );
     }
@@ -1197,6 +1341,7 @@ const handlers = {
     if (problemas.length) {
       content.push({ type: 'text', text: `\nNo se pudieron mostrar:\n${problemas.join('\n')}` });
     }
+    if (avisoVivo) content.push({ type: 'text', text: `\n${avisoVivo}` });
     return content;
   },
 
@@ -1210,19 +1355,12 @@ const handlers = {
     const dir = destino
       ? path.resolve(destino.replace(/^~(?=$|\/)/, os.homedir()))
       : path.join(os.homedir(), 'Downloads');
-
-    const where = await commonFilters({ chat, desde, hasta });
-    where.push(`m.media_path IS NOT NULL AND m.media_path <> ''`);
-    where.push(`m.message_type IN (${tipos.map(sqlString).join(', ')})`);
-    if (contiene) {
-      where.push(`lower(m.text) LIKE ${sqlString(`%${likeLiteral(String(contiene).toLowerCase())}%`)} ESCAPE '\\'`);
-    }
-
-    const rows = await selectMessages('messages m', where.join(' AND '), 'DESC', max * 3);
-
     if (!fs.existsSync(dir)) {
       throw new Error(`La carpeta de destino no existe: ${dir}`);
     }
+
+    const { filas: rows, avisoVivo, chatNoEncontrado } = await buscarAdjuntos({ chat, tipos, contiene, desde, hasta, limite: max * 3 });
+    if (chatNoEncontrado) throw new Error(`No encontré ningún chat que coincida con "${chatNoEncontrado}", ni en el archivo ni en WhatsApp en vivo.`);
 
     const hechos = [];
     const fallados = [];
@@ -1242,14 +1380,23 @@ const handlers = {
         limpio(senderLabel(m)),
       ].filter(Boolean).join('_');
 
-      const ext = extensionDe(m.media_path);
-      let salida = path.join(dir, `${base}${ext}`);
-      for (let i = 2; fs.existsSync(salida); i += 1) salida = path.join(dir, `${base}-${i}${ext}`);
+      // Documentos: con su nombre ORIGINAL (WhatsApp lo guarda). El resto: fecha_chat_remitente.
+      let ext = extensionDe(m.media_path);
+      let raiz = base;
+      const original = nombreOriginal(m);
+      if (original) {
+        const limpioArchivo = original.replace(/[\/:\0]/g, '-').trim();
+        ext = path.extname(limpioArchivo) || ext;
+        raiz = limpioArchivo.slice(0, limpioArchivo.length - path.extname(limpioArchivo).length);
+      }
+      let salida = path.join(dir, `${raiz}${ext}`);
+      for (let i = 2; fs.existsSync(salida); i += 1) salida = path.join(dir, `${raiz} (${i})${ext}`);
 
       try {
         fs.copyFileSync(m.media_path, salida);
         const kb = Math.round(fs.statSync(salida).size / 1024);
-        const contexto = m.text && !looksLikeBlob(m.text) ? `\n   "${String(m.text).trim().slice(0, 120)}"` : '';
+        const acompana = original ? m.media_title : m.text;
+        const contexto = acompana && !looksLikeBlob(acompana) ? `\n   mensaje: "${String(acompana).trim().slice(0, 120)}"` : '';
         hechos.push(
           `• ${salida}\n   ${kb} KB — ${m.timestamp} en "${m.chat_name}", de ${senderLabel(m)}${contexto}`
         );
@@ -1260,15 +1407,17 @@ const handlers = {
 
     if (hechos.length === 0) {
       return (
+        (avisoVivo ? `${avisoVivo}\n\n` : '') +
         `No encontré ningún archivo para exportar${chat ? ` en "${chat}"` : ''}` +
         `${contiene ? ` que mencione "${contiene}"` : ''}.` +
-        ` Recordá que sólo hay archivos desde el 2026-08-06.` +
+        ` Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac.` +
         (fallados.length ? `\n\n${fallados.join('\n')}` : '')
       );
     }
 
     return (
-      `${hechos.length} archivo(s) copiado(s) a ${dir}:\n\n${hechos.join('\n')}` +
+      `${hechos.length} archivo(s) copiado(s) a ${dir}. Verificá que fecha, chat y nombre sean los que pidió el usuario antes de usarlo:\n\n${hechos.join('\n')}` +
+      (avisoVivo ? `\n\n${avisoVivo}` : '') +
       (fallados.length ? `\n\nNo se pudieron copiar:\n${fallados.join('\n')}` : '')
     );
   },

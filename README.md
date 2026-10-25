@@ -11,7 +11,8 @@ Todo corre en tu computadora. Tus chats no se suben a ningún servidor (ver [Pri
 - *"¿Qué me dijo Juan sobre la propuesta la semana pasada?"*
 - *"Buscá en todos mis chats dónde se habló de la factura de marzo."*
 - *"¿Cuáles son mis últimos 5 chats? ¿Me contestó Ana?"*
-- *"Mostrame el PDF que me mandó Laura ayer"* — y lo lee de verdad.
+- *"Mostrame el PDF que me mandó Laura ayer"* o *"leé el Word que me pasaron recién"* — y los lee de
+  verdad, aunque hayan llegado hace un minuto.
 - *"Pasame a Descargas la foto del contrato que mandaron en el grupo."*
 - *"¿Qué me dijo Martín en el audio de ayer?"* — si instalás la [transcripción local](#notas-de-voz-opcional).
 - *"Prepará un follow-up para Pedro con lo que hablamos"* — te abre WhatsApp con el mensaje escrito; lo mandás vos.
@@ -173,8 +174,8 @@ Claves: `porMinuto`, `porHora`, `largoMax`, `antiDifusion`, `colaMax`, `colaEspe
   plano. Para lo de último momento, Claude lee WhatsApp en vivo (necesita el permiso del paso 2).
 - **En grupos grandes, muchos mensajes no tienen nombre de quién los mandó**: WhatsApp no guarda el
   nombre de la gente que no tenés agendada. Los chats individuales no tienen este problema.
-- **Sólo hay archivos (fotos, PDFs) desde que vinculaste WhatsApp Desktop.** Los de antes nunca se
-  bajaron a la Mac.
+- **Sólo hay archivos (fotos, PDFs, documentos) desde que vinculaste WhatsApp Desktop.** Los de antes
+  nunca se bajaron a la Mac. Los Word se leen completos; los Excel hay que exportarlos.
 - **Los audios se transcriben sólo si instalás la [transcripción local](#notas-de-voz-opcional)**; si no, sabe que existen pero no qué dicen.
 - **Para preparar un mensaje necesita el número de teléfono.** Funciona con tus contactos agendados;
   para gente no agendada WhatsApp oculta el número, y tenés que pasárselo vos.
