@@ -642,7 +642,9 @@ const CODIGO_VIVO = Object.fromEntries(Object.entries(TIPO_VIVO).map(([k, v]) =>
 
 async function adjuntosEnVivo({ jid, chatTexto, tipos, contiene, desde, hasta, limite }) {
   const container = path.dirname(await sourcePath());
-  const w = ["mi.ZMEDIALOCALPATH IS NOT NULL", "mi.ZMEDIALOCALPATH <> ''"];
+  // Sin filtrar por ZMEDIALOCALPATH: un adjunto que WhatsApp no descargó (los grandes no se bajan
+  // solos) tiene que aparecer como tal. Si se descarta en silencio, el modelo inventa un motivo.
+  const w = [];
   const codigos = tipos.map((t) => CODIGO_VIVO[t]).filter(Boolean);
   w.push(`m.ZMESSAGETYPE IN (${codigos.join(', ')})`);
   if (jid) w.push(`(s.ZCONTACTJID = ${sqlString(jid)} OR s.ZCONTACTIDENTIFIER = ${sqlString(jid)})`);
@@ -657,7 +659,7 @@ async function adjuntosEnVivo({ jid, chatTexto, tipos, contiene, desde, hasta, l
     ` strftime('%Y-%m-%d %H:%M', m.ZMESSAGEDATE + ${APPLE_EPOCH}, 'unixepoch', 'localtime') AS timestamp,` +
     ` m.ZISFROMME AS from_me, m.ZMESSAGETYPE AS codigo, m.ZTEXT AS text, mi.ZTITLE AS media_title,` +
     ` mi.ZMEDIALOCALPATH AS ruta_rel, s.ZPARTNERNAME AS chat_name, s.ZCONTACTJID AS chat_jid,` +
-    ` gm.ZCONTACTNAME AS member_name, gm.ZMEMBERJID AS member_jid` +
+    ` gm.ZCONTACTNAME AS member_name, gm.ZMEMBERJID AS member_jid, mi.ZFILESIZE AS bytes` +
     ` FROM ZWAMESSAGE m JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM` +
     ` JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER` +
     ` WHERE ${w.join(' AND ')} ORDER BY m.ZMESSAGEDATE DESC LIMIT ${limite}`
@@ -665,7 +667,8 @@ async function adjuntosEnVivo({ jid, chatTexto, tipos, contiene, desde, hasta, l
   return filas.map((f) => ({
     message_id: f.message_id, ts: f.ts, timestamp: f.timestamp, from_me: f.from_me,
     message_type: TIPO_VIVO[f.codigo], text: f.text, media_title: f.media_title,
-    media_path: path.join(container, 'Message', f.ruta_rel),
+    media_path: f.ruta_rel ? path.join(container, 'Message', f.ruta_rel) : null,
+    descargado: Boolean(f.ruta_rel), bytes: f.bytes,
     chat_name: f.chat_name, chat_jid: f.chat_jid,
     // senderLabel: en un grupo, el miembro; en un DM, la contraparte del chat
     sender_name: f.member_name || null, sender_jid: f.member_jid || f.chat_jid,
@@ -716,11 +719,26 @@ async function buscarAdjuntos({ chat, tipos, contiene, desde, hasta, limite }) {
   return { filas, avisoVivo, chatNoEncontrado: chatTexto && !filas.length ? chatTexto : null };
 }
 
+const tamano = (b) => !b ? '' : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1e3))} KB`;
+
+/** Aviso para un adjunto que existe en el chat pero WhatsApp Desktop no descargó. */
+function avisoNoDescargado(m) {
+  const nombre = nombreOriginal(m) || m.text || TIPOS[m.message_type] || 'archivo';
+  const peso = m.bytes ? `, ${tamano(m.bytes)}` : '';
+  return `${m.timestamp} [${m.chat_name}] «${nombre}»${peso}: WhatsApp Desktop NO lo descargó` +
+    `${m.bytes > 1e8 ? ' (los archivos grandes no se bajan solos)' : ''}. No es un problema de atraso ni de sync:` +
+    ` hay que abrir ese chat en WhatsApp Desktop y tocar el archivo para descargarlo; apenas termine, ya se puede leer/exportar.`;
+}
+
 /** Nombre original de un documento (WhatsApp lo guarda), o null si no es un nombre de archivo. */
 function nombreOriginal(m) {
+  // En documentos, ese campo es el título del archivo (el texto que lo acompaña va en media_title).
+  // A veces WhatsApp lo guarda SIN extensión ("Informe trimestral - final"): se le agrega la real.
   const t = String(m.text || '').trim();
-  if (m.message_type !== 'document' || !t || looksLikeBlob(t) || t.length > 150) return null;
-  return /\.[A-Za-z0-9]{2,5}$/.test(t) ? t : null;
+  if (m.message_type !== 'document' || !t || looksLikeBlob(t) || t.length > 150 || /\n/.test(t)) return null;
+  if (/\.[A-Za-z0-9]{2,5}$/.test(t)) return t;
+  const ext = m.media_path && fs.existsSync(m.media_path) ? extensionDe(m.media_path) : '';
+  return ext ? `${t}${ext}` : t;
 }
 
 /* ------------------------------------------------------------------ */
@@ -968,7 +986,7 @@ QUIÉN DIJO QUÉ: en chats individuales la atribución es confiable. En grupos, 
 
 BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas). Si devuelve poco o nada, reintentá con busqueda_profunda, que matchea subcadenas. Los conteos son exactos sobre todo el archivo; los mensajes mostrados están topeados por 'limit', así que una síntesis de un período largo sale de una MUESTRA — decilo en vez de presentarla como completa. Si un nombre no aparece, la persona puede estar agendada con un apodo: preguntá, no adivines.
 
-ADJUNTOS: imágenes y PDFs se pueden MIRAR con ver_archivos y SACAR a una carpeta con exportar_archivo. Sólo existen los archivos que WhatsApp Desktop descargó (desde que se vinculó). AUDIOS: si la transcripción local está instalada, las notas de voz aparecen como (audio) «texto» y también salen en las búsquedas (sección "En audios"). Es transcripción automática con Whisper: el sentido es confiable, pero los nombres propios y términos en inglés pueden salir mal — no los cites como exactos. Al buscar un NOMBRE en audios, si hay pocos resultados probá también cómo suena mal escrito (ej. "Viatik" → "viatic", "Lucho" → "lucio"): la transcripción falla justo en los nombres poco comunes. Si un audio aparece como "(audio)" sin texto, todavía no se transcribió: usá transcribir_audios. "(audio sin voz detectable)" es silencio o ruido.
+ADJUNTOS: imágenes, PDFs y documentos Word se pueden MIRAR/LEER con ver_archivos y SACAR a una carpeta con exportar_archivo. Estas dos tools miran WhatsApp EN VIVO: los adjuntos NO tienen las 6 h de atraso del archivo — nunca uses el atraso como explicación de por qué falta un adjunto. Si una tool dice que un adjunto NO está descargado, decíselo así al usuario: tiene que abrir el chat en WhatsApp Desktop y tocar el archivo (los grandes no se bajan solos); esperar no lo resuelve. Sólo existen los archivos que WhatsApp Desktop descargó (desde que se vinculó). AUDIOS: si la transcripción local está instalada, las notas de voz aparecen como (audio) «texto» y también salen en las búsquedas (sección "En audios"). Es transcripción automática con Whisper: el sentido es confiable, pero los nombres propios y términos en inglés pueden salir mal — no los cites como exactos. Al buscar un NOMBRE en audios, si hay pocos resultados probá también cómo suena mal escrito (ej. "Viatik" → "viatic", "Lucho" → "lucio"): la transcripción falla justo en los nombres poco comunes. Si un audio aparece como "(audio)" sin texto, todavía no se transcribió: usá transcribir_audios. "(audio sin voz detectable)" es silencio o ruido.
 
 ESCRITURA: este server NO puede enviar mensajes. Sólo prepara borradores: preparar_mensaje (uno) o cola_mensajes (varios; abre el siguiente cuando detecta que el usuario mandó el anterior). Abre WhatsApp con el texto escrito y el usuario decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Nunca digas que enviaste algo: decí que quedó listo para que lo revise y lo mande. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicá el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
 
@@ -1235,10 +1253,11 @@ const handlers = {
       `SELECT strftime('%Y-%m-%d %H:%M', m.ZMESSAGEDATE + ${APPLE_EPOCH}, 'unixepoch', 'localtime') AS timestamp,` +
       ` cs.ZPARTNERNAME AS chat_name, m.ZISFROMME AS from_me,` +
       ` gm.ZCONTACTNAME AS member_name, gm.ZMEMBERJID AS member_jid,` +
-      ` m.ZPUSHNAME AS push_name, m.ZFROMJID AS sender_jid, m.ZTEXT AS text, m.ZMESSAGETYPE AS codigo` +
+      ` m.ZPUSHNAME AS push_name, m.ZFROMJID AS sender_jid, m.ZTEXT AS text, m.ZMESSAGETYPE AS codigo, mi.ZMEDIALOCALPATH AS ruta_rel, mi.ZFILESIZE AS bytes` +
       ` FROM ZWAMESSAGE m` +
       ` LEFT JOIN ZWACHATSESSION cs ON cs.Z_PK = m.ZCHATSESSION` +
       ` LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER` +
+      ` LEFT JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM` +
       ` WHERE ${where.join(' AND ')} ORDER BY m.ZMESSAGEDATE DESC LIMIT ${max}`
     );
 
@@ -1261,7 +1280,8 @@ const handlers = {
       const legible = texto && !looksLikeBlob(texto) ? texto : '';
       // Un documento trae su nombre en ZTEXT: sin esto parecía un mensaje de texto.
       const tipo = { 1: 'imagen', 2: 'video', 3: 'audio', 8: 'documento' }[m.codigo];
-      const cuerpo = tipo === 'documento' ? `(documento: ${legible || 'sin nombre'} — se puede ver/exportar)`
+      const bajado = m.ruta_rel ? 'se puede ver/exportar' : `${m.bytes ? tamano(m.bytes) + ', ' : ''}NO descargado en WhatsApp Desktop: hay que tocarlo ahí para bajarlo`;
+      const cuerpo = tipo === 'documento' ? `(documento: ${legible || 'sin nombre'} — ${bajado})`
         : tipo ? `(${tipo})${legible ? ' ' + legible : ''}` : (legible || '(archivo adjunto)');
       return `${cuando} [${donde}] ${quien}: ${cuerpo}`;
     });
@@ -1283,8 +1303,10 @@ const handlers = {
     let mostrados = 0;
     const problemas = [];
 
+    const sinDescargar = [];
     for (const m of rows) {
       if (mostrados >= max) break;
+      if (m.descargado === false) { sinDescargar.push(avisoNoDescargado(m)); continue; }
       const ruta = m.media_path;
       if (!ruta || !fs.existsSync(ruta)) {
         problemas.push(`${m.timestamp} ${m.chat_name}: el archivo ya no está en disco`);
@@ -1326,7 +1348,8 @@ const handlers = {
     }
 
     if (mostrados === 0) {
-      const detalle = (problemas.length ? `\n\n${problemas.join('\n')}` : '') + (avisoVivo ? `\n\n${avisoVivo}` : '');
+      const detalle = (sinDescargar.length ? `\n\n${sinDescargar.join('\n')}` : '') +
+        (problemas.length ? `\n\n${problemas.join('\n')}` : '') + (avisoVivo ? `\n\n${avisoVivo}` : '');
       return (
         `No hay archivos para mostrar${chat ? ` en "${chat}"` : ''}.` +
         ` Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac;` +
@@ -1336,7 +1359,8 @@ const handlers = {
 
     content.unshift({
       type: 'text',
-      text: `${mostrados} archivo(s)${chat ? ` de "${chat}"` : ''}, del más nuevo al más viejo:`,
+      text: (sinDescargar.length ? `⚠️ Hay adjuntos más nuevos que coinciden pero NO están descargados:\n${sinDescargar.join('\n')}\n\n` : '') +
+        `${mostrados} archivo(s)${chat ? ` de "${chat}"` : ''}, del más nuevo al más viejo:`,
     });
     if (problemas.length) {
       content.push({ type: 'text', text: `\nNo se pudieron mostrar:\n${problemas.join('\n')}` });
@@ -1365,8 +1389,10 @@ const handlers = {
     const hechos = [];
     const fallados = [];
 
+    const sinDescargar = [];
     for (const m of rows) {
       if (hechos.length >= max) break;
+      if (m.descargado === false) { sinDescargar.push(avisoNoDescargado(m)); continue; }
       if (!m.media_path || !fs.existsSync(m.media_path)) {
         fallados.push(`${m.timestamp} ${m.chat_name}: el archivo no está en disco`);
         continue;
@@ -1406,6 +1432,7 @@ const handlers = {
     }
 
     if (hechos.length === 0) {
+      if (sinDescargar.length) return sinDescargar.join('\n');
       return (
         (avisoVivo ? `${avisoVivo}\n\n` : '') +
         `No encontré ningún archivo para exportar${chat ? ` en "${chat}"` : ''}` +
@@ -1416,6 +1443,9 @@ const handlers = {
     }
 
     return (
+      // Si el más nuevo que coincide no está descargado, se dice PRIMERO: si no, el modelo
+      // usa el archivo viejo que sí se exportó como si fuera el pedido.
+      (sinDescargar.length ? `⚠️ El/los más nuevo(s) que coinciden NO están descargados — lo exportado abajo es OTRO archivo, más viejo:\n${sinDescargar.join('\n')}\n\n` : '') +
       `${hechos.length} archivo(s) copiado(s) a ${dir}. Verificá que fecha, chat y nombre sean los que pidió el usuario antes de usarlo:\n\n${hechos.join('\n')}` +
       (avisoVivo ? `\n\n${avisoVivo}` : '') +
       (fallados.length ? `\n\nNo se pudieron copiar:\n${fallados.join('\n')}` : '')

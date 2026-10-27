@@ -198,6 +198,14 @@ Dos defensas:
 - **Word/RTF/OpenDocument se leen como texto con `textutil`** (nativo). Decide el formato por la
   extensión, así que se copia con la que corresponde (wacrawl 0.4.x guarda sin extensión). Tope de
   20.000 caracteres; Excel no está soportado (se exporta).
+- **Adjuntos no descargados.** WhatsApp Desktop no baja solos los archivos grandes (visto: un zip de
+  1,2 GB): el mensaje existe pero `ZMEDIALOCALPATH` está vacío. Antes se filtraban en silencio, la tool
+  decía "no encontré" y el modelo inventó una causa ("el archivo tiene 6 h de atraso, en 30 min me
+  fijo") — falsa, y esperar no lo arreglaba. Ahora se devuelven marcados (`descargado: false`) con el
+  peso y la instrucción real (tocarlo en WhatsApp Desktop). Si el más nuevo que coincide no está
+  descargado y se exporta otro, el aviso va PRIMERO, para que no se use el viejo como si fuera el pedido.
+- El título de un documento a veces viene **sin extensión** ("Informe trimestral - final"): se
+  usa igual como nombre y se le agrega la extensión detectada.
 - `mensajes_recientes` marca los adjuntos: un documento trae su nombre en `ZTEXT` y sin marcar parecía
   un mensaje de texto.
 
