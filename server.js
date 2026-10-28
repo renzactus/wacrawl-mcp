@@ -280,6 +280,8 @@ const LIMITES_DEFAULT = {
   antiDifusion: true,    // mismo texto a otro chat → bloqueado
   colaMax: 30,           // mensajes por cola
   colaEsperaMin: 10,     // sin envío en este lapso → la cola se pausa
+  permitirEnvio: false,  // enviar_mensaje APRIETA ENTER: apagado salvo que la persona lo active
+  enviosPorHora: 10,
 };
 /**
  * Se pueden ajustar en ~/.wacrawl/limites.json (ej. {"porHora": 40}). Es
@@ -316,8 +318,11 @@ function chequearBarreras(telefono, texto, { enCola = false } = {}) {
   const previos = leerBorradores();
   const enVentana = (min) => previos.filter((b) => ahora - b.ts < min * 60000);
 
-  if (!enCola && enVentana(1).length >= LIMITES.porMinuto) {
+  if ((!enCola || enCola === 'envio') && enVentana(1).length >= LIMITES.porMinuto) {
     return `Límite: máximo ${LIMITES.porMinuto} borradores por minuto. Esperá un momento.`;
+  }
+  if (enCola === 'envio' && enVentana(60).filter((b) => b.envio).length >= LIMITES.enviosPorHora) {
+    return `Límite: máximo ${LIMITES.enviosPorHora} envíos por hora. Esto frena una ráfaga; se libera solo (ajustable en ~/.wacrawl/limites.json).`;
   }
   if (enVentana(60).length >= LIMITES.porHora) {
     return `Límite: máximo ${LIMITES.porHora} borradores por hora. Esto frena una ráfaga; se libera solo.`;
@@ -370,6 +375,51 @@ async function telefonoDeChat(chat) {
     );
   }
   throw new Error(`"${nombre}" no es un chat individual.`);
+}
+
+/**
+ * Envío real: aprieta Enter en WhatsApp Desktop (la app oficial, así no hay riesgo de bloqueo por
+ * usar un cliente no oficial). Antes verifica que WhatsApp sea la app al frente: si el foco se fue
+ * a otra ventana, el Enter caería ahí. Necesita permiso de Accesibilidad para el proceso
+ * responsable (el runtime de node); sin él macOS rechaza el keystroke y se avisa cómo darlo.
+ */
+const ENTER_BIN = process.env.WACRAWL_ENTER_BIN || null;   // sólo para test
+
+const SCRIPT_ENTER = `
+tell application "WhatsApp" to activate
+delay 0.4
+tell application "System Events"
+  set frente to name of first application process whose frontmost is true
+  if frente is not "WhatsApp" then error "frente:" & frente
+  key code 36
+end tell`;
+
+function presionarEnter() {
+  return new Promise((resolve, reject) => {
+    const [bin, args] = ENTER_BIN ? [ENTER_BIN, []] : ['/usr/bin/osascript', ['-e', SCRIPT_ENTER]];
+    execFile(bin, args, { timeout: 15000 }, (err, _out, stderr) => {
+      if (!err) return resolve();
+      const msg = String(stderr || err.message);
+      if (/frente:/.test(msg)) {
+        const app = msg.split('frente:')[1].split('(')[0].trim();
+        reject(new Error(`No envié: WhatsApp no quedó al frente (estaba ${app}), y el Enter habría caído ahí. El mensaje quedó escrito en WhatsApp sin enviar.`));
+      } else if (/1002|not allowed to send keystrokes|assistive/i.test(msg)) {
+        reject(new Error(
+          'No envié: macOS no le da permiso de Accesibilidad a este server para apretar Enter. ' +
+          'El usuario tiene que ir a Ajustes del Sistema → Privacidad y seguridad → Accesibilidad → + → ⌘⇧G → ' +
+          `${process.execPath} → activarlo. El mensaje quedó escrito en WhatsApp sin enviar.`
+        ));
+      } else if (/-1743|not authorized to send apple events|no autorizado/i.test(msg)) {
+        reject(new Error(
+          'No envié: macOS no le permite a este server controlar "System Events". El usuario tiene que ir a ' +
+          'Ajustes del Sistema → Privacidad y seguridad → Automatización y activar System Events para node. ' +
+          'El mensaje quedó escrito en WhatsApp sin enviar.'
+        ));
+      } else {
+        reject(new Error(`No envié: ${msg.trim().slice(0, 200)}. El mensaje quedó escrito en WhatsApp sin enviar.`));
+      }
+    });
+  });
 }
 
 /** Abre WhatsApp en el chat con el texto escrito. No envía. */
@@ -834,8 +884,12 @@ async function resolveChatJID(chat) {
     );
   }
 
-  const exact = rows.filter((c) => (c.name || '').toLowerCase() === needle);
-  const candidates = exact.length ? exact : rows;
+  // Los chats de estados (las historias, *@*.status) tienen el mismo nombre que la persona pero no son
+  // una conversación: si hay otro candidato, no cuentan. Sin esto "Juan Pérez" era "ambiguo".
+  const conversaciones = rows.filter((c) => c.kind !== 'status' && !String(c.jid).endsWith('.status'));
+  const pool = conversaciones.length ? conversaciones : rows;
+  const exact = pool.filter((c) => (c.name || '').toLowerCase() === needle);
+  const candidates = exact.length ? exact : pool;
   if (candidates.length === 1) return candidates[0].jid;
 
   const top = candidates.slice(0, 10).map((c) => `  • ${c.name} — ${c.jid} (${c.message_count} mensajes)`);
@@ -988,7 +1042,7 @@ BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas).
 
 ADJUNTOS: imágenes, PDFs y documentos Word se pueden MIRAR/LEER con ver_archivos y SACAR a una carpeta con exportar_archivo. Estas dos tools miran WhatsApp EN VIVO: los adjuntos NO tienen las 6 h de atraso del archivo — nunca uses el atraso como explicación de por qué falta un adjunto. Si una tool dice que un adjunto NO está descargado, decíselo así al usuario: tiene que abrir el chat en WhatsApp Desktop y tocar el archivo (los grandes no se bajan solos); esperar no lo resuelve. Sólo existen los archivos que WhatsApp Desktop descargó (desde que se vinculó). AUDIOS: si la transcripción local está instalada, las notas de voz aparecen como (audio) «texto» y también salen en las búsquedas (sección "En audios"). Es transcripción automática con Whisper: el sentido es confiable, pero los nombres propios y términos en inglés pueden salir mal — no los cites como exactos. Al buscar un NOMBRE en audios, si hay pocos resultados probá también cómo suena mal escrito (ej. "Viatik" → "viatic", "Lucho" → "lucio"): la transcripción falla justo en los nombres poco comunes. Si un audio aparece como "(audio)" sin texto, todavía no se transcribió: usá transcribir_audios. "(audio sin voz detectable)" es silencio o ruido.
 
-ESCRITURA: este server NO puede enviar mensajes. Sólo prepara borradores: preparar_mensaje (uno) o cola_mensajes (varios; abre el siguiente cuando detecta que el usuario mandó el anterior). Abre WhatsApp con el texto escrito y el usuario decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Nunca digas que enviaste algo: decí que quedó listo para que lo revise y lo mande. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicá el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
+ESCRITURA: enviar_mensaje ENVÍA de verdad (si el usuario lo activó en esta Mac). Usala sólo cuando el usuario pidió explícitamente mandar/enviar, mostrándole antes destinatario y texto exacto; si dice redactar o preparar, usá preparar_mensaje. Nunca reintentes un envío que respondió \"no pude confirmar\". Para borradores: preparar_mensaje (uno) o cola_mensajes (varios; abre el siguiente cuando detecta que el usuario mandó el anterior). Abre WhatsApp con el texto escrito y el usuario decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Con preparar_mensaje y cola_mensajes nunca digas que enviaste algo: decí que quedó listo para que lo revise y lo mande. Sólo enviar_mensaje con respuesta \"✓ Enviado\" es un envío. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicá el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
 
 const TOOLS = [
   {
@@ -1107,6 +1161,22 @@ const TOOLS = [
       properties: {
         chat: { type: 'string', description: 'Destinatario: nombre del chat, JID, o número de teléfono con código de país.' },
         texto: { type: 'string', description: 'El mensaje a dejar escrito. Máx 2000 caracteres.' },
+      },
+      required: ['chat', 'texto'],
+    },
+  },
+  {
+    name: 'enviar_mensaje',
+    description:
+      'ENVÍA de verdad un mensaje de WhatsApp a un chat individual, desde la app oficial de la Mac, y verifica que haya salido. ' +
+      'Usala SÓLO si el usuario pidió explícitamente ENVIAR/MANDAR (no "redactar" ni "preparar": para eso es preparar_mensaje) ' +
+      'y después de mostrarle el texto exacto y el destinatario. No sirve para grupos. Si responde que no pudo confirmar el envío, ' +
+      'NO la vuelvas a llamar con el mismo mensaje: puede haber salido igual; pedile al usuario que mire WhatsApp.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: { type: 'string', description: 'Destinatario: nombre del chat, JID, o número con código de país.' },
+        texto: { type: 'string', description: 'El mensaje exacto a enviar. Máx 2000 caracteres.' },
       },
       required: ['chat', 'texto'],
     },
@@ -1478,6 +1548,50 @@ const handlers = {
       `Abrí WhatsApp en el chat con "${nombre}" con el mensaje escrito.\n` +
       `NO se envió nada: el usuario lo revisa y aprieta Enter si está bien.${aviso}`
     );
+  },
+
+  async enviar_mensaje({ chat, texto }) {
+    const lim = cargarLimites();
+    if (!lim.permitirEnvio) {
+      throw new Error(
+        'El envío automático está desactivado en esta Mac (por defecto lo está). Mientras tanto usá preparar_mensaje, ' +
+        'que deja el mensaje escrito para que el usuario lo mande. Para activarlo, el usuario pone "permitirEnvio": true en ~/.wacrawl/limites.json.'
+      );
+    }
+    if (!chat || !String(chat).trim()) throw new Error('`chat` es obligatorio.');
+    const cuerpo = String(texto || '').trim();
+    if (!cuerpo) throw new Error('`texto` está vacío.');
+    if (cuerpo.length > lim.largoMax) throw new Error(`El texto tiene ${cuerpo.length} caracteres; el máximo es ${lim.largoMax}.`);
+    if (cola && cola.estado === 'activa') {
+      throw new Error('Hay una cola de borradores en curso: enviar ahora pisaría el que el usuario está por mandar.');
+    }
+
+    const destino = await telefonoDeChat(chat);
+    const bloqueo = chequearBarreras(destino.telefono, cuerpo, { enCola: 'envio' });
+    if (bloqueo) throw new Error(bloqueo);
+
+    const antes = Date.now();
+    await abrirBorrador(destino, cuerpo, { envio: true });
+    await sleep(1500);   // que WhatsApp abra el chat y ponga el texto
+
+    // Un segundo Enter es seguro: si el primero mandó, la caja quedó vacía y no manda nada.
+    let enviado = false;
+    for (let intento = 1; intento <= 2 && !enviado; intento += 1) {
+      await presionarEnter();
+      for (let i = 0; i < 12 && !enviado; i += 1) {
+        await sleep(500);
+        enviado = await detectarEnvio(destino, antes);
+      }
+    }
+
+    const aviso = destino.conocido ? '' : ' (era un número con el que nunca habías hablado)';
+    if (!enviado) {
+      return (
+        `No pude confirmar que el mensaje a "${destino.nombre}" haya salido: apreté Enter pero no apareció en WhatsApp. ` +
+        `Quedó escrito en el chat; que el usuario lo revise y lo mande. NO reintentes: podría duplicarse.`
+      );
+    }
+    return `✓ Enviado a "${destino.nombre}"${aviso}, verificado en WhatsApp:\n\n${cuerpo}`;
   },
 
   async cola_mensajes({ accion, mensajes }) {

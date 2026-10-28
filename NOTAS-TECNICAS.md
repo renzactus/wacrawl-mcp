@@ -209,6 +209,22 @@ Dos defensas:
 - `mensajes_recientes` marca los adjuntos: un documento trae su nombre en `ZTEXT` y sin marcar parecía
   un mensaje de texto.
 
+**Envío (`enviar_mensaje`)**
+
+- Mismo camino que un borrador (`whatsapp://send`) + Enter vía AppleScript (`key code 36` a System
+  Events) + verificación con `detectarEnvio` en la base viva. App oficial: sin riesgo de cliente no
+  oficial. Opt-in con `permitirEnvio` en `limites.json`, que activa la persona; herramienta separada
+  de `preparar_mensaje` para que el permiso por llamada de Claude Desktop sea una confirmación humana.
+- Antes del Enter verifica que WhatsApp sea la app al frente: si el foco se fue, el Enter caería en otra
+  ventana. Un segundo Enter si no se detectó el envío es seguro: si el primero mandó, la caja quedó vacía.
+- Si no se confirma, **no reintenta** y se le pide al modelo que no reintente: puede haber salido igual.
+- Permisos: Accesibilidad para el runtime (keystroke, error 1002) y Automatización → System Events
+  (error -1743). Cada error se traduce a la instrucción exacta.
+- Los intentos sin confirmar cuentan para `enviosPorHora`: prudente ante un modelo que insiste.
+
+**Resolución de nombres:** los chats de estados (`*.status`) tienen el nombre de la persona y se
+excluyen si hay otro candidato — antes "Juan Pérez" daba "coincide con 2 chats" en todas las tools.
+
 **Los PDF se renderizan a imagen con `sips`**, no se les extrae el texto: macOS no trae nada nativo
 para extraerlo (Spotlight no indexa el container de WhatsApp, PyObjC no está), y renderizar sirve
 también para escaneados. Sale sólo la primera página.

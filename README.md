@@ -141,7 +141,31 @@ Si editás el vocabulario, re-transcribí lo viejo (en segundo plano, retoma si 
 
 Sólo transcribe audios que estén en tu Mac (los que WhatsApp Desktop descargó desde que lo vinculaste).
 
-## Mandar mensajes (borradores)
+## Mandar mensajes
+
+### Envío directo (opcional, apagado por defecto)
+
+Claude puede **mandar** el mensaje, no sólo dejarlo escrito: abre el chat en WhatsApp Desktop, aprieta
+Enter y **verifica en la base de WhatsApp que salió**. Usa la app oficial, así que no hay riesgo de
+bloqueo por cliente no oficial.
+
+Para activarlo:
+
+1. `~/.wacrawl/limites.json` → `"permitirEnvio": true`
+2. Ajustes del Sistema → **Privacidad y seguridad → Accesibilidad** → **+** → **⌘⇧G** → la ruta que
+   termina en `/runtime/bin/node` → activarlo. (Es para poder apretar Enter; la primera vez macOS
+   también puede preguntar por controlar "System Events": aceptá.)
+3. ⌘Q y reabrí Claude Desktop.
+
+Recomendado: **dejá que Claude Desktop te pida permiso cada vez** que use `enviar_mensaje` (no
+elijas "permitir siempre"). Es la última barrera, y el modelo no la puede saltear.
+
+Barreras propias del envío: máximo 3 por minuto y 10 por hora (`enviosPorHora`), nunca el mismo texto
+a dos personas, sólo chats individuales, no aprieta Enter si WhatsApp no está al frente (el Enter
+caería en otra app), y si no puede confirmar que salió **no reintenta** — para no duplicarlo. Mientras
+manda, WhatsApp se pone al frente un par de segundos; necesita la Mac desbloqueada.
+
+### Borradores
 
 Claude no envía: **abre WhatsApp en el chat con el mensaje escrito** y vos lo revisás y mandás.
 
