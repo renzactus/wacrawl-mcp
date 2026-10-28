@@ -149,13 +149,17 @@ Claude puede **mandar** el mensaje, no sólo dejarlo escrito: abre el chat en Wh
 Enter y **verifica en la base de WhatsApp que salió**. Usa la app oficial, así que no hay riesgo de
 bloqueo por cliente no oficial.
 
-Para activarlo:
+Viene **apagado a propósito**: mandar mensajes en tu nombre lo decidís vos. Para activarlo:
 
-1. `~/.wacrawl/limites.json` → `"permitirEnvio": true`
-2. Ajustes del Sistema → **Privacidad y seguridad → Accesibilidad** → **+** → **⌘⇧G** → la ruta que
-   termina en `/runtime/bin/node` → activarlo. (Es para poder apretar Enter; la primera vez macOS
-   también puede preguntar por controlar "System Events": aceptá.)
-3. ⌘Q y reabrí Claude Desktop.
+```bash
+~/wacrawl-mcp/activar-envio.sh
+```
+
+El script lo activa y te abre la pantalla de **Accesibilidad** con la ruta ya copiada: tocá **+**,
+**⌘⇧G**, pegá, **Abrir**, y activalo (es para poder apretar Enter). Después ⌘Q y reabrí Claude
+Desktop. La primera vez macOS puede preguntar si puede controlar "System Events": aceptá.
+
+Para apagarlo: `~/wacrawl-mcp/activar-envio.sh --apagar` (toma efecto sin reiniciar).
 
 Recomendado: **dejá que Claude Desktop te pida permiso cada vez** que use `enviar_mensaje` (no
 elijas "permitir siempre"). Es la última barrera, y el modelo no la puede saltear.
@@ -212,6 +216,7 @@ Claves: `porMinuto`, `porHora`, `largoMax`, `antiDifusion`, `colaMax`, `colaEspe
 | No aparece en Claude | Cerrá con **⌘Q**, corré `register.sh`, abrí. Si lo registraste con Claude abierto, se borró al cerrar. |
 | macOS pregunta *"node would like to access data from other apps"* cada vez | Falta el paso 2 (o se le dio el permiso a otro node). Tiene que ser la ruta que termina en `/runtime/bin/node`. |
 | Un audio aparece como "(audio)" sin texto | Todavía no se transcribió (la primera pasada tarda horas) o no está instalada: `check.sh audios`. Pedile a Claude que lo transcriba. |
+| Claude dice que no puede enviar | Está apagado (`activar-envio.sh`) o falta el permiso de Accesibilidad: el mensaje de error dice cuál. |
 | La cola no pasa al siguiente | Necesita el permiso del paso 2 para detectar que mandaste. Pedile *"estado de la cola"*: te dice por qué se pausó. |
 | Las respuestas parecen viejas | `check.sh` → sección "Salud del sync". El sync se repara solo si WhatsApp renumeró su base; si no, te avisa con una notificación. |
 | "No encontré ningún chat" con alguien que sí tenés | Está agendado con otro nombre o un apodo. Decile cómo lo tenés agendado. |

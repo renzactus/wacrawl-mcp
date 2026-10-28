@@ -53,6 +53,7 @@ archivo quedó atrás.
 | `transcribir.py` | transcripción con Whisper/MLX (`--pendientes` o lista por `--stdin`) |
 | `setup-whisper.sh` | instala uv, Python gestionado y el modelo; prueba y arranca la pasada inicial |
 | `rehacer-transcripciones.sh` | re-transcribe en segundo plano lo hecho con otro vocabulario |
+| `activar-envio.sh` | prende/apaga `permitirEnvio` y abre la pantalla de Accesibilidad |
 | `whisper.env` | versiones de Python, librería y modelo: única fuente de verdad |
 
 ## Permisos de macOS

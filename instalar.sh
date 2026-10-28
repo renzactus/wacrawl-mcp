@@ -136,3 +136,5 @@ echo " Si algo no anda: $REPO/check.sh"
 echo
 echo " Opcional — transcribir notas de voz en tu Mac (sin mandarlas a nadie):"
 echo "   $REPO/setup-whisper.sh"
+echo " Opcional — que Claude pueda MANDAR mensajes (viene apagado):"
+echo "   $REPO/activar-envio.sh"
