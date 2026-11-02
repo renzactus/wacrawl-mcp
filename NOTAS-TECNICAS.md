@@ -21,6 +21,23 @@ La decisión central: hay **dos** bases, y cada tool sabe de cuál lee.
 No hay una sola tool "inteligente" que elija: conviene saber cuál contestó. Si Meta cambia el
 esquema CoreData de WhatsApp, se rompe sólo lo que lee en vivo y el histórico sigue intacto.
 
+### Tercera, opcional: el histórico del iPhone
+
+WhatsApp Desktop recibe ~1 año al vincularse. `importar-iphone.sh` importa el resto desde un backup
+de Finder a `~/.wacrawl/historico/wacrawl.db`, con `historico/corte.json` al lado. Para las tools es
+transparente: `countDistinct`, `selectMessages` y `queryChats` corren la consulta en los dos
+archivos (`enAmbos`) y unen.
+
+- **Va aparte, no mergeado al principal.** Cuando WhatsApp renumera, el sync hace `import --restore`,
+  que deja el principal *exactamente* igual a lo que tiene Desktop: se llevaría puesto lo importado.
+- **Cada archivo responde su tramo.** Se solapan en el último año. `corte` es el primer mes desde el
+  cual el principal tiene ≥95% de los mensajes del iPhone, mes a mes: antes contesta el histórico,
+  desde ahí el principal. Así los conteos suman sin duplicar (deduplicar por `msg_id` entre dos
+  bases no se puede en un solo `wacrawl sql`).
+- **Chats unidos por JID**: se suman los conteos, gana el nombre del principal (es el actual) y los
+  no leídos del histórico se ignoran (son de la foto del iPhone).
+- **Si no hay histórico, todo corre exactamente como antes** (una consulta, sin tramo).
+
 ## Tools
 
 | Tool | Fuente | Para qué |
@@ -54,6 +71,7 @@ archivo quedó atrás.
 | `setup-whisper.sh` | instala uv, Python gestionado y el modelo; prueba y arranca la pasada inicial |
 | `rehacer-transcripciones.sh` | re-transcribe en segundo plano lo hecho con otro vocabulario |
 | `activar-envio.sh` | prende/apaga `permitirEnvio` y abre la pantalla de Accesibilidad |
+| `importar-iphone.sh` | importa una vez los años viejos desde un backup del iPhone a `~/.wacrawl/historico` |
 | `whisper.env` | versiones de Python, librería y modelo: única fuente de verdad |
 
 ## Permisos de macOS
@@ -92,6 +110,25 @@ Dos defensas:
   wacrawl aborta con *"belongs to a different event"*. Se arregla con `import --restore`;
   `sync-wrapper.sh` lo hace solo, con backup previo, y revierte si el archivo se achica más de 5%.
 - **`--db <ruta>` + `sql` sirve para consultar cualquier SQLite**, incluida la base viva de WhatsApp.
+
+**Backup del iPhone (`importar-iphone.sh`)**
+
+- **El esquema del iPhone es el mismo que el de WhatsApp Desktop** (la app de Mac es la de iOS
+  compilada con Catalyst): `wacrawl --source <carpeta>` lo importa tal cual si la carpeta tiene la
+  forma del container (`ChatStorage.sqlite`, `Message/Media/...`). El dominio en el backup es
+  `AppDomainGroup-group.net.whatsapp.WhatsApp.shared`; los archivos están por hash en `Manifest.db`.
+- **macOS no deja leer `~/Library/Application Support/MobileSync/Backup`** sin Acceso total al disco
+  (ni desde la terminal ni desde Claude). Moverlo con Finder a otra carpeta es instantáneo y lo resuelve.
+- **Enlazar, no copiar.** Hard links desde el backup: cero espacio extra, y al borrar el backup los
+  archivos de WhatsApp quedan. `COPYFILE_FICLONE_FORCE` de Node da `ENOSYS` en macOS; `cp -c` sí clona.
+- **wacrawl copia la base de chats a `$TMPDIR/wacrawl-desktop-*` para importarla** (1,9 GB en un iPhone
+  con 2,3M de mensajes) y si se lo mata deja esa copia: hay que limpiarla. Con el disco justo, eso
+  solo lo llena.
+- **"source contains multiple WhatsApp account identities"**: wacrawl junta los `ZTOJID` de los
+  mensajes recibidos y exige uno solo. Un iPhone real tenía UNA fila (de 2,3M) con un grupo como
+  destinatario. El script limpia esas filas en su copia si la cuenta principal es >99%.
+- **`Manifest.db` y `ChatStorage.sqlite` no abren con `sqlite3 ?mode=ro` en su lugar** (están en WAL
+  y no puede crear el `-shm`): clonarlas o usar `?immutable=1`.
   Verificado en 0.3.7 y 0.4.2 que no la modifica (mismo md5, mismos archivos). `--db` no acepta URIs
   (`file:...?mode=ro`).
 - **0.4.x guarda la media copiada por hash y sin extensión** (`media/46/4637a2f5…`); 0.3.x conservaba

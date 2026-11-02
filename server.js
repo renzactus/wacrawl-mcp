@@ -70,9 +70,9 @@ function runWacrawl(args) {
   return result;
 }
 
-/** Ejecuta un SELECT y devuelve las filas. `--sync never` = lectura pura. */
-async function runSQL(sql) {
-  const out = await runWacrawl(['--sync', 'never', '--json', 'sql', sql]);
+/** Ejecuta un SELECT y devuelve las filas. `--sync never` = lectura pura. Sin `db`, el archivo principal. */
+async function runSQL(sql, db = null) {
+  const out = await runWacrawl([...(db ? ['--db', db] : []), '--sync', 'never', '--json', 'sql', sql]);
   const trimmed = out.trim();
   if (!trimmed) return [];
   let parsed;
@@ -82,6 +82,62 @@ async function runSQL(sql) {
     throw new Error(`wacrawl devolvió una salida no-JSON: ${trimmed.slice(0, 400)}`);
   }
   return (Array.isArray(parsed) ? parsed : [parsed]).filter((r) => r && typeof r === 'object');
+}
+
+/* ------------------------------------------------------------------ */
+/* histórico del iPhone: un segundo archivo, fijo, con los años viejos  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * WhatsApp Desktop recibe ~1 año de historia al vincularse. Los años anteriores se importan
+ * una vez desde un backup del iPhone (importar-iphone.sh) a un archivo APARTE: cuando WhatsApp
+ * renumera, el sync reconstruye el principal entero con lo que tiene Desktop, y se llevaría
+ * puesto lo importado.
+ *
+ * Los dos se solapan en el último año, así que cada uno responde sólo su tramo: el histórico
+ * antes de `corte`, el principal desde `corte` (el primer mes en que el principal ya está
+ * completo). Así los conteos suman sin duplicar.
+ */
+const HISTORICO_DIR = process.env.WACRAWL_HISTORICO_DIR || path.join(os.homedir(), '.wacrawl/historico');
+
+function historico() {
+  try {
+    const info = JSON.parse(fs.readFileSync(path.join(HISTORICO_DIR, 'corte.json'), 'utf8'));
+    const db = path.join(HISTORICO_DIR, 'wacrawl.db');
+    if (Number.isFinite(info.corte) && fs.existsSync(db)) return { ...info, db };
+  } catch {}
+  return null;
+}
+
+/** Hasta dónde llega la historia en ESTA Mac, para las instrucciones del server. */
+function profundidad() {
+  const h = historico();
+  if (!h) {
+    return 'el archivo tiene lo que WhatsApp Desktop recibió del teléfono al vincularse, más todo lo que llegó después. Suele cubrir meses, no años.';
+  }
+  return `además de lo que WhatsApp Desktop recibió al vincularse, en esta Mac se importó la historia del iPhone ` +
+    `(backup del ${h.backup}): las búsquedas cubren desde ${h.desde}. Lo que llegó después de ese backup entra por el sync normal. ` +
+    `Los adjuntos viejos son los que el iPhone tenía guardados${h.sinVideos ? ' (sin videos ni stickers)' : ''}. ` +
+    `Los audios de antes del ${h.corteFecha} pueden no estar transcriptos: transcribir_audios los transcribe a pedido.`;
+}
+
+/** Qué adjuntos existen en esta Mac, para explicar por qué falta uno. */
+function queArchivosHay() {
+  const h = historico();
+  if (!h) {
+    return 'Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac;' +
+      ' de mensajes anteriores existe el registro pero no el archivo.';
+  }
+  return `Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac y los que el` +
+    ` iPhone tenía guardados al hacer el backup${h.adjuntosDesde ? ` (desde ${h.adjuntosDesde})` : ''}` +
+    `${h.sinVideos ? ', sin videos ni stickers' : ''}; de lo anterior existe el registro pero no el archivo.`;
+}
+
+/** La misma consulta en los dos archivos, cada uno en su tramo. `armar` recibe la condición de fecha. */
+function enAmbos(armar) {
+  const h = historico();
+  if (!h) return [runSQL(armar(''))];
+  return [runSQL(armar(` AND m.ts >= ${h.corte}`)), runSQL(armar(` AND m.ts < ${h.corte}`), h.db)];
 }
 
 /* ------------------------------------------------------------------ */
@@ -596,7 +652,7 @@ async function buscarEnAudios({ terms, jid, desde, hasta, de_mi, limite }) {
   if (!fs.existsSync(transcDb())) return null;
   const w = ["texto <> ''"];
   for (const t of terms) w.push(`lower(texto) LIKE ${sqlString(`%${likeLiteral(t.toLowerCase())}%`)} ESCAPE '\\'`);
-  if (jid) w.push(`chat_jid = ${sqlString(jid)}`);
+  if (jid) w.push(`chat_jid IN (${(await variantes(jid)).map(sqlString).join(', ')})`);
   if (desde) w.push(`ts >= ${toEpoch(desde, 'desde')}`);
   if (hasta) w.push(`ts < ${toEpoch(hasta, 'hasta')}`);
   if (typeof de_mi === 'boolean') w.push(`from_me = ${de_mi ? 1 : 0}`);
@@ -697,7 +753,10 @@ async function adjuntosEnVivo({ jid, chatTexto, tipos, contiene, desde, hasta, l
   const w = [];
   const codigos = tipos.map((t) => CODIGO_VIVO[t]).filter(Boolean);
   w.push(`m.ZMESSAGETYPE IN (${codigos.join(', ')})`);
-  if (jid) w.push(`(s.ZCONTACTJID = ${sqlString(jid)} OR s.ZCONTACTIDENTIFIER = ${sqlString(jid)})`);
+  if (jid) {
+    const lista = (await variantes(jid)).map(sqlString).join(', ');
+    w.push(`(s.ZCONTACTJID IN (${lista}) OR s.ZCONTACTIDENTIFIER IN (${lista}))`);
+  }
   else if (chatTexto) w.push(`lower(s.ZPARTNERNAME) LIKE ${sqlString(`%${likeLiteral(chatTexto.toLowerCase())}%`)} ESCAPE '\\'`);
   if (contiene) {
     w.push(`lower(coalesce(m.ZTEXT, '') || ' ' || coalesce(mi.ZTITLE, '')) LIKE ${sqlString(`%${likeLiteral(String(contiene).toLowerCase())}%`)} ESCAPE '\\'`);
@@ -835,12 +894,18 @@ const MSG_COLUMNS =
   ` strftime('%Y-%m-%d %H:%M', m.ts, 'unixepoch', 'localtime') AS timestamp`;
 
 async function countDistinct(from, clause) {
-  const [row] = await runSQL(`SELECT count(*) AS n FROM (SELECT 1 FROM ${from} WHERE ${clause} ${GROUPING})`);
-  return row?.n ?? 0;
+  const partes = await Promise.all(enAmbos((tramo) =>
+    `SELECT count(*) AS n FROM (SELECT 1 FROM ${from} WHERE (${clause})${tramo} ${GROUPING})`));
+  return partes.reduce((total, [row]) => total + (row?.n ?? 0), 0);
 }
 
-const selectMessages = (from, clause, order, limit) =>
-  runSQL(`SELECT ${MSG_COLUMNS} FROM ${from} WHERE ${clause} ${GROUPING} ORDER BY m.ts ${order} LIMIT ${limit}`);
+async function selectMessages(from, clause, order, limit) {
+  const partes = await Promise.all(enAmbos((tramo) =>
+    `SELECT ${MSG_COLUMNS} FROM ${from} WHERE (${clause})${tramo} ${GROUPING} ORDER BY m.ts ${order} LIMIT ${limit}`));
+  if (partes.length === 1) return partes[0];
+  const filas = partes.flat().sort((a, b) => (order === 'ASC' ? a.ts - b.ts : b.ts - a.ts));
+  return filas.slice(0, limit);
+}
 
 /* ------------------------------------------------------------------ */
 /* dominio                                                             */
@@ -849,21 +914,99 @@ const selectMessages = (from, clause, order, limit) =>
 // Ojo con `chats.last_message_at`: hay filas con fechas corruptas (año 9026)
 // que encabezarían cualquier orden por fecha. Usamos max(m.ts) de los mensajes
 // reales, que no puede mentir.
-const CHATS_SQL =
+const chatsSQL = (tramo) =>
   `SELECT c.jid, c.kind, c.name, c.unread_count,` +
   ` count(m.rowid) AS message_count,` +
-  ` strftime('%Y-%m-%dT%H:%M:%SZ', max(m.ts), 'unixepoch') AS last_message_at,` +
   ` max(m.ts) AS last_ts` +
-  ` FROM chats c LEFT JOIN messages m ON m.chat_jid = c.jid AND m.deleted_at IS NULL` +
+  ` FROM chats c LEFT JOIN messages m ON m.chat_jid = c.jid AND m.deleted_at IS NULL${tramo}` +
   ` WHERE c.deleted_at IS NULL`;
 
 const ORDERS = {
-  recientes: 'last_ts DESC',
-  mensajes: 'message_count DESC',
+  recientes: (a, b) => (b.last_ts || 0) - (a.last_ts || 0),
+  mensajes: (a, b) => b.message_count - a.message_count,
 };
 
-const listChats = (orden = 'recientes') =>
-  runSQL(`${CHATS_SQL} GROUP BY c.jid ORDER BY ${ORDERS[orden] || ORDERS.recientes}`);
+/**
+ * La misma persona puede tener dos JID: WhatsApp pasó muchos contactos al "@lid" nuevo (Desktop
+ * ya los guarda así) y el iPhone o los chats viejos los tienen con el número. Sin unirlos, un chat
+ * sale dos veces y buscarlo por nombre da "ambiguo". `contacts.lid` de cada archivo da el par.
+ */
+let aliasCache = null;
+
+async function aliasesLid() {
+  if (aliasCache && Date.now() - aliasCache.t < 10 * 60 * 1000) return aliasCache.mapa;
+  const sql = `SELECT jid, lid FROM contacts WHERE lid LIKE '%@lid' AND jid LIKE '%@s.whatsapp.net'`;
+  const h = historico();
+  const filas = (await Promise.all([runSQL(sql), h ? runSQL(sql, h.db) : []])).flat();
+  const mapa = new Map();
+  for (const { jid, lid } of filas) { mapa.set(lid, jid); mapa.set(jid, lid); }
+  aliasCache = { t: Date.now(), mapa };
+  return mapa;
+}
+
+/** Los JID con que puede aparecer un chat: el dado y, si lo hay, su par @lid ⇄ número. */
+async function variantes(jid) {
+  const par = (await aliasesLid()).get(jid);
+  return par ? [jid, par] : [jid];
+}
+
+/**
+ * Los conteos por chat del histórico se calculan UNA vez y quedan en historico/chats.json: es una
+ * foto fija y la consulta tarda ~15 s, lo mismo que la del principal. Repetirla duplicaba lo que
+ * tarda listar_chats, y precalentarla al arrancar trababa la primera consulta de cada sesión.
+ */
+let chatsHistorico = null;
+
+function chatsDelHistorico(h) {
+  if (chatsHistorico?.corte === h.corte) return chatsHistorico.promesa;
+  const archivo = path.join(HISTORICO_DIR, 'chats.json');
+  let promesa;
+  try {
+    const guardado = JSON.parse(fs.readFileSync(archivo, 'utf8'));
+    if (guardado.corte !== h.corte) throw new Error('es de otra importación');
+    promesa = Promise.resolve(guardado.chats);
+  } catch {
+    promesa = runSQL(`${chatsSQL(` AND m.ts < ${h.corte}`)} GROUP BY c.jid`, h.db).then((chats) => {
+      try { fs.writeFileSync(archivo, JSON.stringify({ corte: h.corte, chats })); } catch {}
+      return chats;
+    });
+    promesa.catch(() => { chatsHistorico = null; });
+  }
+  chatsHistorico = { corte: h.corte, promesa };
+  return promesa;
+}
+
+/** Chats de los dos archivos unidos por persona. `nombre` (en minúsculas) filtra por subcadena. */
+async function queryChats(nombre = null) {
+  const h = historico();
+  const filtro = nombre ? ` AND lower(c.name) LIKE ${sqlString(`%${likeLiteral(nombre)}%`)} ESCAPE '\\'` : '';
+  const [principal, viejos, alias] = await Promise.all([
+    runSQL(`${chatsSQL(h ? ` AND m.ts >= ${h.corte}` : '')}${filtro} GROUP BY c.jid`),
+    h ? chatsDelHistorico(h) : [],
+    aliasesLid(),
+  ]);
+  const partes = [principal, nombre ? viejos.filter((c) => (c.name || '').toLowerCase().includes(nombre)) : viejos];
+  const clave = (jid) => (jid.endsWith('@lid') && alias.get(jid)) || jid;
+  const porJid = new Map();
+  partes.forEach((filas, i) => {
+    for (const c of filas) {
+      const previo = porJid.get(clave(c.jid));
+      // Los no leídos del histórico son de la foto del iPhone, no de hoy.
+      if (!previo) { porJid.set(clave(c.jid), i === 0 ? { ...c } : { ...c, unread_count: 0 }); continue; }
+      previo.unread_count += i === 0 ? c.unread_count : 0;
+      previo.message_count += c.message_count;
+      previo.last_ts = Math.max(previo.last_ts || 0, c.last_ts || 0) || null;
+      previo.name ||= c.name;   // el principal va primero y tiene el nombre actual
+    }
+  });
+  return [...porJid.values()].map((c) => ({
+    ...c,
+    last_message_at: c.last_ts ? new Date(c.last_ts * 1000).toISOString().replace(/\.\d+Z$/, 'Z') : null,
+  }));
+}
+
+const listChats = async (orden = 'recientes') =>
+  (await queryChats()).sort(ORDERS[orden] || ORDERS.recientes);
 
 /** Resuelve un nombre de chat a su JID. Si ya es un JID, lo devuelve tal cual. */
 async function resolveChatJID(chat) {
@@ -871,10 +1014,7 @@ async function resolveChatJID(chat) {
   if (value.includes('@')) return value;
 
   const needle = value.toLowerCase();
-  const rows = await runSQL(
-    `${CHATS_SQL} AND lower(c.name) LIKE ${sqlString(`%${likeLiteral(needle)}%`)} ESCAPE '\\'` +
-    ` GROUP BY c.jid ORDER BY message_count DESC`
-  );
+  const rows = (await queryChats(needle)).sort(ORDERS.mensajes);
 
   if (rows.length === 0) {
     throw new Error(
@@ -1013,7 +1153,7 @@ async function freshnessNote() {
 /** Filtros comunes a las búsquedas. */
 async function commonFilters({ chat, desde, hasta, de_mi }) {
   const where = ['m.deleted_at IS NULL'];
-  if (chat) where.push(`m.chat_jid = ${sqlString(await resolveChatJID(chat))}`);
+  if (chat) where.push(`m.chat_jid IN (${(await variantes(await resolveChatJID(chat))).map(sqlString).join(', ')})`);
   if (desde) where.push(`m.ts >= ${toEpoch(desde, 'desde')}`);
   if (hasta) where.push(`m.ts < ${toEpoch(hasta, 'hasta')}`);
   if (typeof de_mi === 'boolean') where.push(`m.from_me = ${de_mi ? 1 : 0}`);
@@ -1032,7 +1172,7 @@ async function commonFilters({ chat, desde, hasta, de_mi }) {
  */
 const SERVER_INSTRUCTIONS = `Acceso al WhatsApp local del usuario: un archivo histórico (sólo lectura) más WhatsApp Desktop en vivo. Cómo interpretar los resultados:
 
-PROFUNDIDAD: el archivo tiene lo que WhatsApp Desktop recibió del teléfono al vincularse, más todo lo que llegó después. Suele cubrir meses, no años. Si no encontrás algo viejo, decí que no está en el archivo local — no que no existe.
+PROFUNDIDAD: __PROFUNDIDAD__ Si no encontrás algo viejo, decí que no está en el archivo local — no que no existe.
 
 FRESCURA: el archivo se sincroniza cada 6h y un sync tarda minutos, así que NO se puede refrescar durante una consulta. Las tools avisan cuando detectan mensajes más nuevos sin importar. Para "¿me contestó recién?" usá mensajes_recientes, que lee WhatsApp en vivo.
 
@@ -1040,7 +1180,7 @@ QUIÉN DIJO QUÉ: en chats individuales la atribución es confiable. En grupos, 
 
 BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas). Si devuelve poco o nada, reintentá con busqueda_profunda, que matchea subcadenas. Los conteos son exactos sobre todo el archivo; los mensajes mostrados están topeados por 'limit', así que una síntesis de un período largo sale de una MUESTRA — decilo en vez de presentarla como completa. Si un nombre no aparece, la persona puede estar agendada con un apodo: preguntá, no adivines.
 
-ADJUNTOS: imágenes, PDFs y documentos Word se pueden MIRAR/LEER con ver_archivos y SACAR a una carpeta con exportar_archivo. Estas dos tools miran WhatsApp EN VIVO: los adjuntos NO tienen las 6 h de atraso del archivo — nunca uses el atraso como explicación de por qué falta un adjunto. Si una tool dice que un adjunto NO está descargado, decíselo así al usuario: tiene que abrir el chat en WhatsApp Desktop y tocar el archivo (los grandes no se bajan solos); esperar no lo resuelve. Sólo existen los archivos que WhatsApp Desktop descargó (desde que se vinculó). AUDIOS: si la transcripción local está instalada, las notas de voz aparecen como (audio) «texto» y también salen en las búsquedas (sección "En audios"). Es transcripción automática con Whisper: el sentido es confiable, pero los nombres propios y términos en inglés pueden salir mal — no los cites como exactos. Al buscar un NOMBRE en audios, si hay pocos resultados probá también cómo suena mal escrito (ej. "Viatik" → "viatic", "Lucho" → "lucio"): la transcripción falla justo en los nombres poco comunes. Si un audio aparece como "(audio)" sin texto, todavía no se transcribió: usá transcribir_audios. "(audio sin voz detectable)" es silencio o ruido.
+ADJUNTOS: imágenes, PDFs y documentos Word se pueden MIRAR/LEER con ver_archivos y SACAR a una carpeta con exportar_archivo. Estas dos tools miran WhatsApp EN VIVO: los adjuntos NO tienen las 6 h de atraso del archivo — nunca uses el atraso como explicación de por qué falta un adjunto. Si una tool dice que un adjunto NO está descargado, decíselo así al usuario: tiene que abrir el chat en WhatsApp Desktop y tocar el archivo (los grandes no se bajan solos); esperar no lo resuelve. __ARCHIVOS__ AUDIOS: si la transcripción local está instalada, las notas de voz aparecen como (audio) «texto» y también salen en las búsquedas (sección "En audios"). Es transcripción automática con Whisper: el sentido es confiable, pero los nombres propios y términos en inglés pueden salir mal — no los cites como exactos. Al buscar un NOMBRE en audios, si hay pocos resultados probá también cómo suena mal escrito (ej. "Viatik" → "viatic", "Lucho" → "lucio"): la transcripción falla justo en los nombres poco comunes. Si un audio aparece como "(audio)" sin texto, todavía no se transcribió: usá transcribir_audios. "(audio sin voz detectable)" es silencio o ruido.
 
 ESCRITURA: enviar_mensaje ENVÍA de verdad (si el usuario lo activó en esta Mac). Usala sólo cuando el usuario pidió explícitamente mandar/enviar, mostrándole antes destinatario y texto exacto; si dice redactar o preparar, usá preparar_mensaje. Nunca reintentes un envío que respondió \"no pude confirmar\". Para borradores: preparar_mensaje (uno) o cola_mensajes (varios; abre el siguiente cuando detecta que el usuario mandó el anterior). Abre WhatsApp con el texto escrito y el usuario decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Con preparar_mensaje y cola_mensajes nunca digas que enviaste algo: decí que quedó listo para que lo revise y lo mande. Sólo enviar_mensaje con respuesta \"✓ Enviado\" es un envío. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicá el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
 
@@ -1118,7 +1258,7 @@ const TOOLS = [
   {
     name: 'ver_archivos',
     description:
-      'Muestra las imágenes y documentos que se mandaron en un chat, para poder MIRARLOS o LEERLOS (no sólo saber que existen). Word, RTF, OpenDocument y texto se devuelven como texto completo. Los PDF se ven como imagen de su primera página. Incluye lo que llegó hace minutos (mira WhatsApp en vivo, no sólo el archivo). Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac.',
+      'Muestra las imágenes y documentos que se mandaron en un chat, para poder MIRARLOS o LEERLOS (no sólo saber que existen). Word, RTF, OpenDocument y texto se devuelven como texto completo. Los PDF se ven como imagen de su primera página. Incluye lo que llegó hace minutos (mira WhatsApp en vivo, no sólo el archivo). Sólo existen los archivos que hay en esta Mac: los que WhatsApp Desktop descargó desde que se vinculó, y los del histórico del iPhone si se importó.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1422,8 +1562,7 @@ const handlers = {
         (problemas.length ? `\n\n${problemas.join('\n')}` : '') + (avisoVivo ? `\n\n${avisoVivo}` : '');
       return (
         `No hay archivos para mostrar${chat ? ` en "${chat}"` : ''}.` +
-        ` Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac;` +
-        ` de mensajes anteriores existe el registro pero no el archivo.${detalle}`
+        ` ${queArchivosHay()}${detalle}`
       );
     }
 
@@ -1507,7 +1646,7 @@ const handlers = {
         (avisoVivo ? `${avisoVivo}\n\n` : '') +
         `No encontré ningún archivo para exportar${chat ? ` en "${chat}"` : ''}` +
         `${contiene ? ` que mencione "${contiene}"` : ''}.` +
-        ` Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac.` +
+        ` ${queArchivosHay()}` +
         (fallados.length ? `\n\n${fallados.join('\n')}` : '')
       );
     }
@@ -1739,7 +1878,7 @@ async function handleRequest(req) {
         protocolVersion: req.params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
         serverInfo: { name: 'wacrawl-mcp', version: '2.1.0' },
-        instructions: SERVER_INSTRUCTIONS,
+        instructions: SERVER_INSTRUCTIONS.replace('__PROFUNDIDAD__', profundidad()).replace('__ARCHIVOS__', queArchivosHay()),
       };
     case 'ping':
       return {};

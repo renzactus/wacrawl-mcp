@@ -100,8 +100,9 @@ persona que entre a la misma cuenta desde otra computadora **no** puede consulta
 ellas. Si varias personas usan la misma cuenta, cada una tiene que asumir que las demás ven lo que
 consultó. Lo recomendable es una cuenta por persona (un plan Team, por ejemplo).
 
-**Nunca envía nada.** Puede dejarte un mensaje escrito en WhatsApp, pero el que aprieta Enter sos
-vos. No hay forma de que mande algo solo.
+**No envía nada salvo que lo actives.** Por defecto sólo puede dejarte un mensaje escrito en
+WhatsApp y el que aprieta Enter sos vos. El [envío directo](#envío-directo-opcional-apagado-por-defecto)
+viene apagado.
 
 ## Notas de voz (opcional)
 
@@ -193,17 +194,54 @@ Claves: `porMinuto`, `porHora`, `largoMax`, `antiDifusion`, `colaMax`, `colaEspe
 > oficial, pero WhatsApp igual puede restringir un número si muchos desconocidos lo bloquean o lo
 > reportan. Poco volumen y mensajes realmente personalizados.
 
+## Importar años de historia desde el iPhone (opcional)
+
+WhatsApp Desktop sólo recibe alrededor de un año al vincularse, y no hay forma de pedirle más. El
+iPhone tiene todo. Con un backup del iPhone por cable se importa el resto, **una vez**, a un archivo
+aparte (`~/.wacrawl/historico`); Claude busca en los dos como si fueran uno.
+
+**Antes de arrancar, lo que no se puede o cuesta:**
+
+- **Sólo iPhone.** En Android el backup está cifrado de otra forma y este script no lo lee.
+- **El backup de WhatsApp en iCloud no sirve** (cifrado, sin acceso). Tiene que ser el de Finder.
+- **Finder copia el iPhone entero**, no sólo WhatsApp. Es temporal, pero tiene que entrar en el
+  disco: mirá en el iPhone *Ajustes → General → Almacenamiento* cuánto usás. Si no entra, liberá
+  espacio antes.
+- **De los adjuntos viejos vuelven sólo los que el iPhone tenga guardados.** Por defecto quedan
+  afuera videos y stickers (suelen ser la mitad del espacio y Claude no los puede mirar).
+- **Es una foto fija**: lo que llega después del backup entra por el sync de siempre.
+
+**Pasos:**
+
+1. En Finder, con el iPhone conectado: *Hacer copia de seguridad de todos los datos del iPhone en
+   esta Mac*, **sin** tildar *Cifrar copia local* (si está tildado, destildalo para esta copia;
+   Finder te pide la contraseña). *Hacer copia ahora*.
+2. macOS no deja que un script lea esa copia donde Finder la guarda. Abrila y movela:
+   ```bash
+   mkdir -p ~/backup-iphone && open ~/backup-iphone && open ~/Library/Application\ Support/MobileSync/Backup
+   ```
+   Arrastrá la carpeta del backup (nombre largo tipo `00008140-…`, la de fecha más nueva) a
+   `backup-iphone`. Es instantáneo y no ocupa espacio extra.
+3. Importá (tarda unos 15 minutos; `--con-videos` si querés todo):
+   ```bash
+   ~/wacrawl-mcp/importar-iphone.sh ~/backup-iphone/<carpeta>
+   ```
+4. Borrá el backup: seleccioná la carpeta en Finder y ⌥⌘⌫. Lo de WhatsApp ya quedó afuera.
+
+Los audios viejos no se transcriben solos (serían días de Mac): Claude los transcribe a pedido.
+
 ## Lo que no hace (y conviene saber)
 
-- **No tiene todo tu historial.** Tiene lo que WhatsApp Desktop recibió del teléfono al vincularse
-  (suelen ser meses, no años) más todo lo que llegó desde entonces. Si algo viejo no aparece, no
-  está en tu Mac.
+- **No tiene todo tu historial** salvo que [importes el del iPhone](#importar-años-de-historia-desde-el-iphone-opcional).
+  Tiene lo que WhatsApp Desktop recibió del teléfono al vincularse (suele ser alrededor de un año)
+  más todo lo que llegó desde entonces. Si algo viejo no aparece, no está en tu Mac.
 - **El archivo va hasta 6 horas atrás.** Actualizarlo tarda minutos, así que se hace en segundo
   plano. Para lo de último momento, Claude lee WhatsApp en vivo (necesita el permiso del paso 2).
 - **En grupos grandes, muchos mensajes no tienen nombre de quién los mandó**: WhatsApp no guarda el
   nombre de la gente que no tenés agendada. Los chats individuales no tienen este problema.
-- **Sólo hay archivos (fotos, PDFs, documentos) desde que vinculaste WhatsApp Desktop.** Los de antes
-  nunca se bajaron a la Mac. Los Word se leen completos; los Excel hay que exportarlos.
+- **Sólo hay archivos (fotos, PDFs, documentos) desde que vinculaste WhatsApp Desktop**, salvo los
+  que traiga un [histórico del iPhone](#importar-años-de-historia-desde-el-iphone-opcional). Los Word
+  se leen completos; los Excel hay que exportarlos.
 - **Los audios se transcriben sólo si instalás la [transcripción local](#notas-de-voz-opcional)**; si no, sabe que existen pero no qué dicen.
 - **Para preparar un mensaje necesita el número de teléfono.** Funciona con tus contactos agendados;
   para gente no agendada WhatsApp oculta el número, y tenés que pasárselo vos.
