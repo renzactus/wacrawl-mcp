@@ -18,12 +18,14 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import wave
+import zlib
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -70,9 +72,10 @@ def abrir_transcripciones():
     return db
 
 
-def pendientes(db, limite, rehacer=False):
+def pendientes(db, limite, rehacer=False, antes=0, parte=""):
     """Audios con archivo en disco sin transcripción (o, con rehacer, transcriptos con otro
-    vocabulario), el más nuevo primero."""
+    vocabulario), el más nuevo primero. antes: sólo los anteriores a ese epoch. parte "K/N":
+    sólo uno de cada N audios (por msg_id), para que N procesos se repartan el trabajo."""
     if not os.path.exists(ARCHIVO):
         sys.exit(f"No existe el archivo de wacrawl: {ARCHIVO}")
     if rehacer:
@@ -85,12 +88,15 @@ def pendientes(db, limite, rehacer=False):
     filas = arch.execute(
         """SELECT msg_id, chat_jid, max(chat_name), max(sender_name), max(from_me), max(ts), max(media_path)
            FROM messages
-           WHERE message_type = 'audio' AND media_path <> '' AND deleted_at IS NULL
-           GROUP BY msg_id, chat_jid ORDER BY max(ts) DESC"""
+           WHERE message_type = 'audio' AND media_path <> '' AND deleted_at IS NULL AND (? = 0 OR ts < ?)
+           GROUP BY msg_id, chat_jid ORDER BY max(ts) DESC""", (antes, antes)
     ).fetchall()
     arch.close()
+    k, n = (int(x) for x in parte.split("/")) if parte else (1, 1)
     salida = []
     for msg_id, chat_jid, chat_name, sender_name, from_me, ts, media_path in filas:
+        if n > 1 and zlib.crc32(msg_id.encode()) % n != k - 1:
+            continue
         if (msg_id, chat_jid) in hechos or not os.path.isfile(media_path):
             continue
         salida.append(dict(msg_id=msg_id, chat_jid=chat_jid, chat_name=chat_name, sender_name=sender_name,
@@ -264,7 +270,16 @@ def main():
     g.add_argument("--vocabulario-base", action="store_true", help="imprimir un vocabulario sugerido")
     ap.add_argument("--limite", type=int, default=0, help="máximo de audios (0 = sin límite)")
     ap.add_argument("--minutos", type=float, default=0, help="cortar después de N minutos (0 = sin límite)")
+    ap.add_argument("--archivo", help="otro archivo de wacrawl (ej. el histórico del iPhone) en vez del principal")
+    ap.add_argument("--antes", type=int, default=0, help="sólo audios anteriores a este epoch")
+    ap.add_argument("--parte", default="", help="K/N: la parte K de N, para correr N procesos en paralelo")
     args = ap.parse_args()
+    m = re.fullmatch(r"([1-9]\d*)/([1-9]\d*)", args.parte) if args.parte else None
+    if args.parte and not (m and int(m[1]) <= int(m[2])):
+        sys.exit("--parte va como K/N, ej. 2/3")
+    if args.archivo:
+        global ARCHIVO
+        ARCHIVO = os.path.expanduser(args.archivo)
 
     if args.vocabulario_base:
         print(vocabulario_base())
@@ -276,7 +291,11 @@ def main():
     # quedaría colgado. Puede correr en paralelo; la base está en WAL.
     os.makedirs(DIR, exist_ok=True)
     if args.pendientes or args.rehacer:
-        candado = open(os.path.join(DIR, "transcribir.lock"), "w")
+        # Cada archivo y cada parte con su candado: una pasada larga sobre el histórico no
+        # frena la de los audios nuevos que corre después de cada sync.
+        sufijo = ("-" + os.path.basename(os.path.dirname(ARCHIVO)) if args.archivo else "") + \
+                 ("-" + args.parte.replace("/", "de") if args.parte else "")
+        candado = open(os.path.join(DIR, f"transcribir{sufijo}.lock"), "w")
         try:
             fcntl.flock(candado, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -289,7 +308,7 @@ def main():
         hechos = {(m, c) for m, c in db.execute("SELECT msg_id, chat_jid FROM transcripciones")}
         lista = [a for a in lista if (a["msg_id"], a["chat_jid"]) not in hechos]
     else:
-        lista = pendientes(db, args.limite, rehacer=args.rehacer)
+        lista = pendientes(db, args.limite, rehacer=args.rehacer, antes=args.antes, parte=args.parte)
 
     if not lista:
         print("nada para transcribir", file=sys.stderr)
@@ -301,7 +320,7 @@ def main():
         sys.exit("Falta mlx-whisper: corré ./setup-whisper.sh")
 
     inicio = time.time()
-    hechos = errores = 0
+    hechos = errores = seguidos = 0
     seg_audio = 0.0
     with tempfile.TemporaryDirectory() as tmp:
         for a in lista:
@@ -316,8 +335,17 @@ def main():
                 texto = limpiar(r)
             except Exception as e:  # un audio roto no frena al resto
                 errores += 1
+                seguidos += 1
                 print(f"error en {a['msg_id']}: {str(e)[:120]}", file=sys.stderr)
+                if seguidos >= 10:
+                    # Diez seguidos no son audios rotos sino la Mac: sin memoria, afconvert dejó
+                    # de abrir todo y una pasada quemó 45.000 audios en minutos. Se espera; lo que
+                    # falló no se guarda, así que se reintenta en la próxima pasada.
+                    print("10 errores seguidos: espero 2 min", file=sys.stderr)
+                    time.sleep(120)
+                    seguidos = 0
                 continue
+            seguidos = 0
             db.execute(
                 "INSERT OR REPLACE INTO transcripciones VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (a["msg_id"], a["chat_jid"], a.get("chat_name"), a.get("sender_name"), a.get("from_me"),

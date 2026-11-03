@@ -228,7 +228,16 @@ aparte (`~/.wacrawl/historico`); Claude busca en los dos como si fueran uno.
    ```
 4. Borrá el backup: seleccioná la carpeta en Finder y ⌥⌘⌫. Lo de WhatsApp ya quedó afuera.
 
-Los audios viejos no se transcriben solos (serían días de Mac): Claude los transcribe a pedido.
+Los audios viejos no se transcriben solos: Claude los transcribe a pedido. Para hacerlos todos, dejá
+la Mac enchufada y con la tapa abierta una o varias noches (una M4 transcribe unas 10 veces más rápido
+de lo que dura el audio: 300 horas de audio son más de un día). Va del más nuevo al más viejo, se
+puede parar y retoma donde quedó:
+
+```bash
+~/wacrawl-mcp/transcribir-historico.sh                   # o con fecha: … 1 2026-01-01 (sólo lo anterior)
+~/wacrawl-mcp/transcribir-historico.sh estado            # cuánto va, por año
+~/wacrawl-mcp/transcribir-historico.sh parar
+```
 
 ## Lo que no hace (y conviene saber)
 

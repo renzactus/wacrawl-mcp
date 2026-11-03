@@ -72,6 +72,7 @@ archivo quedó atrás.
 | `rehacer-transcripciones.sh` | re-transcribe en segundo plano lo hecho con otro vocabulario |
 | `activar-envio.sh` | prende/apaga `permitirEnvio` y abre la pantalla de Accesibilidad |
 | `importar-iphone.sh` | importa una vez los años viejos desde un backup del iPhone a `~/.wacrawl/historico` |
+| `transcribir-historico.sh` | transcribe los audios del histórico en N procesos (`--archivo/--antes/--parte` de `transcribir.py`) |
 | `whisper.env` | versiones de Python, librería y modelo: única fuente de verdad |
 
 ## Permisos de macOS
@@ -209,6 +210,13 @@ Dos defensas:
 - Anti-alucinaciones: se descartan segmentos con `no_speech_prob > 0.6` y `avg_logprob < -1`, y las
   frases de subtítulos de YouTube que Whisper inventa ante silencio ("Subtítulos realizados por la
   comunidad de Amara.org"). `condition_on_previous_text=False` evita que un error se arrastre.
+- **Velocidad en una M4 16 GB** (turbo, fp16): ~10× tiempo real con la Mac libre, ~7,5× con poca
+  memoria. **Paralelizar no sirve**: con 2 procesos la placa de video ya va al 100% y el total bajó
+  (6,7×), porque cada proceso ocupa 5–6 GB y la Mac pasa a swap. **Decodificar en lote** (`decode`
+  con varios mel a la vez) tampoco: ×0,93, y cambia algunas palabras respecto de `transcribe`.
+- **Sin memoria, afconvert deja de abrir todo** (`ExtAudioFileRead failed (-1)`, también en archivos
+  sanos): una pasada del histórico quemó 45.000 audios como error en minutos. Con 10 errores seguidos
+  se esperan 2 min; lo que falla no se guarda y se reintenta en la pasada siguiente.
 - **Vocabulario** (`initial_prompt`): nombre del chat + en grupos, los 6 que más hablan (desde el
   archivo, sin emojis) + `~/.wacrawl/vocabulario.txt` por prioridad. **Whisper usa como mucho ~223
   tokens de pista y, si se pasa, descarta el PRINCIPIO**: por eso se arma término a término contando
