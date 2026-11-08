@@ -1,52 +1,52 @@
 #!/bin/bash
-# Registra el MCP server en Claude Desktop, sin tocar los otros servers que ya
-# tengas configurados.
+# Registers the MCP server with Claude Desktop, without touching any other servers you
+# already have configured.
 #
-# IMPORTANTE: correr con Claude Desktop CERRADO (⌘Q, no sólo cerrar la ventana).
-# La app lee claude_desktop_config.json al arrancar y lo REESCRIBE desde memoria
-# al salir: si se edita con la app abierta, al cerrarla la entrada se pierde.
+# IMPORTANT: run it with Claude Desktop QUIT (⌘Q, not just closing the window).
+# The app reads claude_desktop_config.json when it starts and REWRITES it from memory
+# when it quits: if you edit it while the app is open, the entry is lost when it quits.
 
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 CFG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 
-# Sólo para test: apunta a un config de prueba y saltea el chequeo de la app.
+# Tests only: point to a test config and skip the check for the app.
 if [ -n "${WACRAWL_TEST_CONFIG:-}" ]; then
   CFG="$WACRAWL_TEST_CONFIG"
 else
-  # pgrep no sirve: macOS trunca el nombre del proceso a 16 caracteres
-  # ("/Applications/Cl"). Vamos por la línea de comando completa.
+  # pgrep doesn't work: macOS truncates the process name to 16 characters
+  # ("/Applications/Cl"). Match the full command line instead.
   if ps -ax -o args= | grep -F "Claude.app/Contents/MacOS/Claude" | grep -vF grep >/dev/null; then
-    echo "✗ Claude Desktop está abierto. Cerralo con ⌘Q y volvé a correr esto."
-    echo "  (si queda abierto, al cerrarlo borra lo que se agregue ahora)"
+    echo "✗ Claude Desktop is open. Quit it with ⌘Q and run this again."
+    echo "  (if it stays open, quitting it later erases whatever is added now)"
     exit 1
   fi
 fi
 
 SERVER="$REPO/server.js"
-[ -f "$SERVER" ] || { echo "✗ No encuentro $SERVER"; exit 1; }
+[ -f "$SERVER" ] || { echo "✗ Can't find $SERVER"; exit 1; }
 
-# Runtime dedicado si existe: el permiso de macOS queda acotado a este server.
+# The dedicated runtime if there is one: the macOS permission stays limited to this server.
 if [ -x "$REPO/runtime/bin/node" ]; then
   NODE="$REPO/runtime/bin/node"
 else
   NODE="$(command -v node || true)"
-  echo "  (sin runtime dedicado; usando $NODE — corré ./setup-runtime.sh)"
+  echo "  (no dedicated runtime; using $NODE — run ./setup-runtime.sh)"
 fi
-[ -n "$NODE" ] && [ -x "$NODE" ] || { echo "✗ No encuentro node."; exit 1; }
+[ -n "$NODE" ] && [ -x "$NODE" ] || { echo "✗ Can't find node."; exit 1; }
 
 WACRAWL=""
 for c in "$HOME/.local/bin/wacrawl" /opt/homebrew/bin/wacrawl /usr/local/bin/wacrawl; do
   [ -x "$c" ] && { WACRAWL="$c"; break; }
 done
-[ -n "$WACRAWL" ] || { echo "✗ No encuentro wacrawl. Corré ./instalar.sh primero."; exit 1; }
+[ -n "$WACRAWL" ] || { echo "✗ Can't find wacrawl. Run ./install.sh first."; exit 1; }
 
 mkdir -p "$(dirname "$CFG")"
 [ -f "$CFG" ] || echo '{}' > "$CFG"
 cp "$CFG" "$CFG.bak.$(date +%Y%m%d%H%M%S)"
 
-# Claude Desktop no hereda el PATH del shell: todas las rutas van absolutas.
+# Claude Desktop doesn't inherit the shell's PATH: every path goes in absolute.
 "$NODE" -e '
 const fs = require("fs");
 const [cfgPath, node, server, wacrawl] = process.argv.slice(1);
@@ -54,7 +54,7 @@ const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8") || "{}");
 cfg.mcpServers = cfg.mcpServers || {};
 cfg.mcpServers.wacrawl = { command: node, args: [server], env: { WACRAWL_BIN: wacrawl } };
 fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n");
-console.log("✓ Registrado en Claude Desktop. Servers configurados:", Object.keys(cfg.mcpServers).join(", "));
+console.log("✓ Registered with Claude Desktop. Configured servers:", Object.keys(cfg.mcpServers).join(", "));
 ' "$CFG" "$NODE" "$SERVER" "$WACRAWL"
 
-echo "→ Abrí Claude Desktop: tiene que aparecer 'wacrawl' entre los conectores."
+echo "→ Open Claude Desktop: 'wacrawl' should show up among your connectors."

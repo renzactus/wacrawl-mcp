@@ -1,4 +1,4 @@
-# Nunca versionar datos de WhatsApp ni nada derivado del archivo.
+# Never version WhatsApp data or anything derived from the archive.
 *.db
 *.db-wal
 *.db-shm
@@ -6,17 +6,18 @@
 *.sqlite-wal
 *.sqlite-shm
 
-# Logs y backups de config
+# Logs and config backups
 *.log
 *.bak
 *.bak.*
 claude_desktop_config.json
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 .DS_Store
 node_modules/
 
-# Backup de un skill personal que apareció en esta carpeta; no es parte del server.
-skill-backup/
-
-# Copia dedicada de node (67 MB). Se rearma con ./setup-runtime.sh
+# Dedicated copy of node (~67 MB). Rebuilt with ./setup-runtime.sh
 runtime/

@@ -1,302 +1,370 @@
-# WhatsApp para Claude (wacrawl-mcp)
+# wacrawl-mcp
 
-Le da a **Claude Desktop** acceso a tu WhatsApp, desde tu Mac: buscar en todas tus conversaciones,
-leer hilos, ver imágenes y PDFs que te mandaron, y dejarte mensajes **escritos pero sin enviar**
-para que los mandes vos.
+**Your WhatsApp, inside Claude — on your Mac.** An [MCP](https://modelcontextprotocol.io) server that lets
+Claude Desktop search every chat, read threads, look at the photos and documents people sent you,
+understand voice notes (transcribed locally), and write messages: as drafts you send yourself, or — if
+you turn it on — sent directly, with a check that they went out.
 
-Todo corre en tu computadora. Tus chats no se suben a ningún servidor (ver [Privacidad](#privacidad)).
+Everything runs on your computer. Your chats aren't uploaded anywhere (see [Privacy](#privacy)).
 
-## Qué le podés pedir
+> Unofficial project. Not affiliated with WhatsApp, Meta or Anthropic.
 
-- *"¿Qué me dijo Juan sobre la propuesta la semana pasada?"*
-- *"Buscá en todos mis chats dónde se habló de la factura de marzo."*
-- *"¿Cuáles son mis últimos 5 chats? ¿Me contestó Ana?"*
-- *"Mostrame el PDF que me mandó Laura ayer"* o *"leé el Word que me pasaron recién"* — y los lee de
-  verdad, aunque hayan llegado hace un minuto.
-- *"Pasame a Descargas la foto del contrato que mandaron en el grupo."*
-- *"¿Qué me dijo Martín en el audio de ayer?"* — si instalás la [transcripción local](#notas-de-voz-opcional).
-- *"Prepará un follow-up para Pedro con lo que hablamos"* — te abre WhatsApp con el mensaje escrito; lo mandás vos.
-- *"Armá mensajes personalizados para estas 6 personas"* — te los va abriendo de a uno, a medida que mandás.
+## What you can ask
 
-## Requisitos
+- *"What did Sam say about the proposal last week?"*
+- *"Search all my chats for where we talked about the March invoice."*
+- *"What are my last 5 chats? Did Ana reply?"*
+- *"Show me the PDF Laura sent yesterday"* or *"read the Word doc they just sent me"* — it actually reads
+  them, even if they arrived a minute ago.
+- *"Save the photo of the contract from the group to my Downloads."*
+- *"What did Martín say in yesterday's voice note?"* — with [local transcription](#voice-notes-optional).
+- *"Draft a follow-up to Pedro about what we discussed"* — WhatsApp opens with the message typed; you send it.
+- *"Write personalized messages for these 6 people"* — they open one at a time, as you send each one.
+- *"Send Ana: running 10 minutes late"* — with [direct sending](#direct-sending-optional-off-by-default)
+  turned on, Claude sends it and checks that it went out.
+
+## How it works
+
+```mermaid
+flowchart LR
+  WA["WhatsApp Desktop<br/>(Mac app)"] -->|sync every 6 h| W[wacrawl]
+  W --> A[("local archive<br/>~/.wacrawl")]
+  A --> S[wacrawl-mcp]
+  WA -->|live reads| S
+  S -->|drafts and sends| WA
+  S <-->|MCP over stdio| C[Claude Desktop]
+```
+
+- [wacrawl](https://github.com/openclaw/wacrawl) reads WhatsApp Desktop's local database and keeps a
+  searchable SQLite archive, refreshed by a background sync every 6 hours.
+- This server gives Claude tools over that archive, plus live reads of WhatsApp Desktop for whatever
+  arrived in the last few hours.
+- Writing goes through the official app: a `whatsapp://` link opens the chat with the text typed in.
+  Direct sending (opt-in) presses Enter for you and checks WhatsApp's database to confirm the message
+  went out.
+
+One file (`server.js`), no npm dependencies, no network.
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `search_messages` | Full-text search across every chat, including transcribed voice notes |
+| `deep_search` | Substring search, for when full-text finds too little |
+| `list_chats` | Chats by recent activity or by volume, with unread counts |
+| `read_chat` | A thread in chronological order |
+| `recent_messages` | What arrived seconds ago, read live from WhatsApp |
+| `view_attachments` | Look at images and PDFs, read Word documents |
+| `export_attachments` | Copy an attachment to a folder, to use it |
+| `transcribe_audio` | Transcribe voice notes on demand, locally |
+| `draft_message` | Open WhatsApp with a message typed, unsent |
+| `draft_queue` | Several drafts, opened one at a time as you send them |
+| `send_message` | Send for real and verify it went out (opt-in, off by default) |
+
+## Requirements
 
 | | |
 |---|---|
-| **Mac** con macOS 13 o más nuevo | no anda en Windows/Linux ([ver alternativa](#windows-o-linux)) |
-| **WhatsApp Desktop** (la app de Mac, no WhatsApp Web), vinculada con tu teléfono | [whatsapp.com/download](https://www.whatsapp.com/download) o App Store |
+| **Mac** with macOS 13 or newer | it doesn't run on Windows or Linux ([alternative](#windows-or-linux)) |
+| **WhatsApp Desktop** (the Mac app, not WhatsApp Web), linked to your phone | [whatsapp.com/download](https://www.whatsapp.com/download) or the App Store |
 | **Claude Desktop** | [claude.ai/download](https://claude.ai/download) |
-| **Node.js 18+** | [nodejs.org](https://nodejs.org) o `brew install node` |
+| **Node.js 18+** | [nodejs.org](https://nodejs.org) or `brew install node` |
 
-No necesita skills, plugins ni configuración extra en Claude: el server le explica a Claude cómo
-usar cada herramienta y cómo interpretar los resultados.
+Voice note transcription also needs an Apple Silicon Mac (M1 or later).
 
-## Instalación
+Claude doesn't need skills, plugins or any extra setup: the server tells Claude how to use each tool
+and how to read the results.
 
-**1. Bajá el repo y corré el instalador** (en Terminal):
+## Install
+
+**1. Clone the repo and run the installer** (in Terminal):
 
 ```bash
 git clone https://github.com/renzactus/wacrawl-mcp.git ~/wacrawl-mcp
 cd ~/wacrawl-mcp
-./instalar.sh
+./install.sh
 ```
 
-(El repo es privado: necesitás que te den acceso en GitHub, y tener `git` autenticado — por ejemplo
-con `gh auth login`.)
+It checks the requirements, installs `wacrawl` (verifying its checksum), builds your local archive, sets
+up an automatic sync every 6 hours, and tells you what's left. The first import takes a few minutes.
 
-Chequea los requisitos, instala `wacrawl` (verificando su checksum), arma tu archivo local, deja un
-sync automático cada 6 horas, y te dice lo que falta. La primera importación tarda varios minutos.
+If macOS asks whether **Terminal** can access data from other apps, allow it: that's how it reads WhatsApp.
 
-Si macOS pregunta si **Terminal** puede acceder a datos de otras apps, aceptá: es para leer WhatsApp.
+**2. Grant Full Disk Access** (macOS doesn't let a script do it):
 
-**2. Dale el permiso de disco** (macOS no deja hacerlo por script):
+System Settings → **Privacy & Security** → **Full Disk Access** → **+** → **⌘⇧G** → paste the path the
+installer showed you (it ends in `/runtime/bin/node`) → **Open** → turn it on.
 
-Ajustes del Sistema → **Privacidad y seguridad** → **Acceso total al disco** → botón **+** →
-**⌘⇧G** → pegá la ruta que te mostró el instalador (termina en `/runtime/bin/node`) → **Abrir** → activalo.
+> That permission is only for a copy of node used **exclusively** by this server — not for your
+> system's node — so no other program inherits it. Almost everything works without it; you just can't
+> see what arrived seconds ago or use the draft queue.
 
-> Ese permiso es sólo para una copia de node que usa **únicamente** este server — no para el node
-> de tu sistema. Así ningún otro programa lo hereda. Sin él igual funciona casi todo; sólo no
-> podés ver lo que llegó hace segundos ni usar la cola de mensajes.
+**3. Register it with Claude, with Claude quit:**
 
-**3. Registralo en Claude, con Claude cerrado:**
-
-Cerrá Claude Desktop con **⌘Q** (cerrar la ventana no alcanza) y corré:
+Quit Claude Desktop with **⌘Q** (closing the window isn't enough) and run:
 
 ```bash
 ~/wacrawl-mcp/register.sh
 ```
 
-Abrí Claude Desktop. Listo.
+Open Claude Desktop. Done.
 
-> **Por qué hay que cerrarlo:** Claude Desktop lee su configuración al abrir y **la reescribe al
-> cerrarse**. Si la editás con la app abierta, al cerrarla se borra lo que agregaste. El script se
-> niega a correr si detecta Claude abierto, para protegerte de eso. Si el instalador vio Claude
-> cerrado, ya hizo este paso por vos.
+> **Why it has to be quit:** Claude Desktop reads its configuration when it starts and **rewrites it
+> when it quits**. If you edit it while the app is open, quitting erases what you added. The script
+> refuses to run if it sees Claude open. If the installer found Claude closed, it already did this step.
 
-## Probar que anda
+The server speaks plain MCP over stdio, so other MCP clients can run it too; the scripts set up Claude
+Desktop.
 
-Preguntale a Claude: *"¿cuáles son mis últimos 3 chats de WhatsApp?"*
+## Check that it works
 
-Si algo no anda, corré el diagnóstico — muestra cómo se ve cada tipo de mensaje, si los horarios
-están bien, cuánto atraso tiene el archivo y si el sync automático está funcionando:
+Ask Claude: *"what are my last 3 WhatsApp chats?"*
+
+If something's off, run the diagnostic — it shows how each message type renders, whether times are
+right, how far behind the archive is, and whether the automatic sync is working:
 
 ```bash
 ~/wacrawl-mcp/check.sh
 ```
 
-(usa `python3`; si macOS ofrece instalar las herramientas de desarrollador, aceptá.)
+(It uses `python3`; if macOS offers to install the developer tools, accept.)
 
-## Privacidad
+## Privacy
 
-**Qué queda en tu Mac:** todo tu WhatsApp. El archivo (`~/.wacrawl/`), las imágenes y documentos, y
-el server mismo. Nada de eso se sube a ningún lado.
+**What stays on your Mac:** all of your WhatsApp. The archive (`~/.wacrawl/`), the images and
+documents, and the server itself. None of it is uploaded anywhere.
 
-**Qué sale de tu Mac:** sólo lo que Claude *lee* para contestarte. Si le preguntás por un chat, los
-mensajes que consulta pasan a esa conversación de Claude, igual que si los hubieras pegado vos. Eso
-queda en tu historial de Claude como cualquier otro chat.
+**What leaves your Mac:** only what Claude *reads* to answer you. If you ask about a chat, the messages
+it looks at go into that Claude conversation, just as if you had pasted them, and they stay in your
+Claude history like any other chat.
 
-**Cuentas de Claude compartidas:** el acceso a tu WhatsApp es de **tu Mac**, no de la cuenta. Otra
-persona que entre a la misma cuenta desde otra computadora **no** puede consultar tu WhatsApp. Pero
-**sí puede ver tus conversaciones de Claude**, incluidos los mensajes de WhatsApp que Claude leyó en
-ellas. Si varias personas usan la misma cuenta, cada una tiene que asumir que las demás ven lo que
-consultó. Lo recomendable es una cuenta por persona (un plan Team, por ejemplo).
+**Shared Claude accounts:** access to your WhatsApp belongs to **your Mac**, not to the account.
+Someone signing in to the same account from another computer can **not** query your WhatsApp. But they
+**can** see your Claude conversations, including any WhatsApp messages Claude read in them. If several
+people share an account, each should assume the others see what they looked up. One account per person
+is the way to go (a Team plan, for example).
 
-**No envía nada salvo que lo actives.** Por defecto sólo puede dejarte un mensaje escrito en
-WhatsApp y el que aprieta Enter sos vos. El [envío directo](#envío-directo-opcional-apagado-por-defecto)
-viene apagado.
+**Nothing is sent unless you turn it on.** By default Claude can only leave a message typed in
+WhatsApp, and you're the one who presses Enter. [Direct sending](#direct-sending-optional-off-by-default)
+is off.
 
-## Notas de voz (opcional)
+## Sending messages
 
-Transcribe tus audios **en tu Mac, sin mandarlos a nadie**, con Whisper (el mismo tipo de modelo que
-usan los servicios pagos). Después Claude los lee como texto y **los encuentra en las búsquedas**:
-*"¿en qué audio me hablaron del precio?"* funciona.
+Three levels, from the most to the least hands-on:
+
+| | What Claude does | Who presses Enter |
+|---|---|---|
+| **Draft** | opens the chat with the message typed | you |
+| **Queue** | several drafts: opens the next one when it sees you sent the current one | you |
+| **Direct send** (opt-in) | types it, presses Enter and checks WhatsApp's database to confirm it went out | Claude |
+
+### Drafts
+
+- **One:** *"draft a message to Ana saying…"*
+- **Several:** *"write messages for these people and queue them up"*. The first one opens; **when it
+  detects you sent it, it opens the next one** (~3 s). If you take your time with one, it waits. If you
+  don't send one within 10 minutes, the queue pauses. You can say *skip*, *resume* or *cancel*.
+
+### Direct sending (optional, off by default)
+
+Claude can **send** the message, not just leave it typed: it opens the chat in WhatsApp Desktop, presses
+Enter, and **checks WhatsApp's database to confirm it went out**. It goes through the official app — no
+unofficial client involved.
+
+It's **off on purpose**: sending messages in your name is your call. To turn it on:
+
+```bash
+~/wacrawl-mcp/enable-sending.sh
+```
+
+The script turns it on and opens the **Accessibility** settings with the path already copied: click
+**+**, **⌘⇧G**, paste, **Open**, and turn it on (that's what lets it press Enter). Then quit (⌘Q) and
+reopen Claude Desktop. The first time, macOS may ask whether it can control "System Events": allow it.
+
+To turn it off: `~/wacrawl-mcp/enable-sending.sh --off` (it takes effect without restarting).
+
+Recommended: **let Claude Desktop ask for your permission every time** it uses `send_message` (don't
+pick "always allow"). It's the last safeguard, and the model can't skip it.
+
+### Safeguards
+
+They live in code, not in the prompt (a runaway model ignores instructions, not an `if`), and their
+counters are saved on disk so restarting doesn't reset them:
+
+- at most 3 drafts per minute and 15 per hour, and at most 10 sends per hour
+- **never the same text to several people** (the broadcast pattern WhatsApp punishes)
+- one-to-one chats only: WhatsApp doesn't open groups this way
+- a warning when it's a number you've never talked to
+- a send only presses Enter if WhatsApp is the frontmost app (otherwise the Enter would land in another
+  app), and if it can't confirm the message went out it **doesn't retry**, so nothing goes out twice
+- **emergency stop:** `touch ~/.wacrawl/STOP` stops every draft and send; delete the file to turn them back on
+
+You can adjust them in `~/.wacrawl/limits.json`, for example `{"perHour": 40, "antiBroadcast": false}`.
+Keys: `perMinute`, `perHour`, `sendsPerHour`, `maxLength`, `antiBroadcast`, `queueMax`, `queueWaitMin`,
+`allowSending`.
+
+> **Careful with cold messages.** Going through the official app avoids the risks of an unofficial
+> client, but WhatsApp's terms forbid bulk and automated messaging, and WhatsApp can restrict a number
+> that many strangers block or report. Keep the volume low and the messages genuinely personal. Your
+> account, your responsibility.
+
+## Voice notes (optional)
+
+Transcribes your voice notes **on your Mac, without sending them anywhere**, with Whisper (the same kind
+of model paid services use). Claude then reads them as text and **finds them in searches**: *"which
+voice note mentioned the price?"* works.
 
 ```bash
 ~/wacrawl-mcp/setup-whisper.sh
 ```
 
-- Necesita una Mac con **chip Apple** (M1 o posterior). Baja el modelo una vez (~1,6 GB).
-- Transcribe todos los audios que tengas en disco en segundo plano (≈2 s por audio, sin frenar la
-  Mac: trabaja el chip gráfico), y después los nuevos en cada sync automático.
-- Si pedís un audio que todavía no se procesó, Claude lo transcribe en el momento.
-- Transcribe de a ~13-17 veces la duración real: un audio de 1 minuto, unos 4 segundos.
+- Needs a Mac with an **Apple chip** (M1 or later). It downloads the model once (~1.6 GB).
+- It asks for the **language** of your voice notes, or detects it per note. You can change it in
+  `~/.wacrawl/whisper.env` (e.g. `WHISPER_LANGUAGE=en`).
+- It transcribes every voice note on disk in the background (≈2 s each, without slowing the Mac down:
+  it runs on the GPU), and after that the new ones on every automatic sync.
+- If you ask about one that hasn't been processed yet, Claude transcribes it on the spot.
+- It runs at ~13-17× real time: a 1-minute voice note takes about 4 seconds.
 
-**Calidad:** muy buena con español rioplatense. El punto débil son los **nombres propios poco
-comunes** — sobre todo el de tu empresa, si no es una palabra del diccionario. Medido sin ayuda, un
-nombre de empresa salió bien sólo 1 de cada 4 veces (y Zapia comete el mismo error). Eso importa más
-para **buscar** que para entender: Claude deduce que "Lucio" es Lucho al leer, pero una búsqueda
-por "Lucho" nunca encuentra ese audio.
+**Quality:** very good with Rioplatense Spanish, where it was measured. The weak spot is **uncommon
+proper names** — especially your company's, if it isn't a dictionary word. Measured without help, a
+company name came out right only 1 time in 4. That matters more for **searching** than for
+understanding: Claude can tell that "viatic" means "Viatik" when reading, but a search for "Viatik"
+never finds that voice note.
 
-Para eso está el **vocabulario** (`~/.wacrawl/vocabulario.txt`): una lista, por prioridad, de los
-nombres que usás. No entrena nada — es una pista que se le da a Whisper en cada audio. El instalador
-te arma uno sugerido a partir de lo que escribís en WhatsApp; **revisalo y poné arriba tu empresa,
-equipo y clientes**. En los grupos, además, se suman solos los nombres de quienes más hablan ahí.
+That's what the **vocabulary** is for (`~/.wacrawl/vocabulary.txt`): a priority-ordered list of the names
+you use. It doesn't train anything — it's a hint Whisper gets with every voice note. The installer builds
+a suggested one from what you write on WhatsApp; **review it and put your company, team and clients at
+the top**. In groups, the names of the people who talk most there are added automatically.
 
-Medido con vocabulario, en 20 audios donde el nombre de la empresa salía mal: **de 0 a 11 bien**, y en
-otros 8, un apodo **de 1 a 7**; sin inventar nombres en audios donde no se dijeron, y sin ser más lento.
+Measured with a vocabulary, on 20 voice notes where the company name came out wrong: **from 0 to 11
+right**, and on another 8, a nickname **from 1 to 7**; without inventing names in voice notes where they
+weren't said, and no slower.
 
-Si editás el vocabulario, re-transcribí lo viejo (en segundo plano, retoma si se corta):
-
-```bash
-~/wacrawl-mcp/rehacer-transcripciones.sh
-```
-
-Sólo transcribe audios que estén en tu Mac (los que WhatsApp Desktop descargó desde que lo vinculaste).
-
-## Mandar mensajes
-
-### Envío directo (opcional, apagado por defecto)
-
-Claude puede **mandar** el mensaje, no sólo dejarlo escrito: abre el chat en WhatsApp Desktop, aprieta
-Enter y **verifica en la base de WhatsApp que salió**. Usa la app oficial, así que no hay riesgo de
-bloqueo por cliente no oficial.
-
-Viene **apagado a propósito**: mandar mensajes en tu nombre lo decidís vos. Para activarlo:
+If you edit the vocabulary, re-transcribe the old ones (in the background; it resumes if interrupted):
 
 ```bash
-~/wacrawl-mcp/activar-envio.sh
+~/wacrawl-mcp/redo-transcriptions.sh
 ```
 
-El script lo activa y te abre la pantalla de **Accesibilidad** con la ruta ya copiada: tocá **+**,
-**⌘⇧G**, pegá, **Abrir**, y activalo (es para poder apretar Enter). Después ⌘Q y reabrí Claude
-Desktop. La primera vez macOS puede preguntar si puede controlar "System Events": aceptá.
+It only transcribes voice notes that are on your Mac (the ones WhatsApp Desktop downloaded since you
+linked it).
 
-Para apagarlo: `~/wacrawl-mcp/activar-envio.sh --apagar` (toma efecto sin reiniciar).
+## Import years of history from your iPhone (optional)
 
-Recomendado: **dejá que Claude Desktop te pida permiso cada vez** que use `enviar_mensaje` (no
-elijas "permitir siempre"). Es la última barrera, y el modelo no la puede saltear.
+WhatsApp Desktop only receives about a year when it's linked, and there's no way to ask it for more. The
+iPhone has everything. With a wired iPhone backup, the rest is imported **once** into a separate archive
+(`~/.wacrawl/historico`); Claude searches both as if they were one.
 
-Barreras propias del envío: máximo 3 por minuto y 10 por hora (`enviosPorHora`), nunca el mismo texto
-a dos personas, sólo chats individuales, no aprieta Enter si WhatsApp no está al frente (el Enter
-caería en otra app), y si no puede confirmar que salió **no reintenta** — para no duplicarlo. Mientras
-manda, WhatsApp se pone al frente un par de segundos; necesita la Mac desbloqueada.
+**Before you start — what can't be done, or takes effort:**
 
-### Borradores
+- **iPhone only.** On Android the backup is encrypted differently and this script can't read it.
+- **WhatsApp's iCloud backup doesn't work** (encrypted, no access). It has to be the Finder backup.
+- **Finder copies the whole iPhone**, not just WhatsApp. It's temporary, but it has to fit on the disk:
+  check *Settings → General → iPhone Storage* to see how much you use. If it doesn't fit, free up space first.
+- **Old attachments come back only if the iPhone still has them.** By default videos and stickers are
+  left out (they're usually half the space, and Claude can't look at them).
+- **It's a snapshot**: whatever arrives after the backup comes in through the usual sync.
 
-Claude no envía: **abre WhatsApp en el chat con el mensaje escrito** y vos lo revisás y mandás.
+**Steps:**
 
-- **Uno:** *"prepará un mensaje para Ana diciendo…"*
-- **Varios:** *"armá mensajes para estas personas y abrímelos en cola"*. Abre el primero; **cuando
-  detecta que lo mandaste, abre el siguiente** (tarda ~3 s). Si te tomás tu tiempo con uno, espera.
-  Si no mandás uno en 10 minutos, se pausa. Le podés decir *saltar*, *reanudar* o *cancelar*.
-
-Barreras que vienen activadas, por si un modelo se desboca:
-
-- máximo 3 borradores por minuto y 15 por hora
-- no deja preparar **el mismo texto para varias personas** (patrón de difusión, que WhatsApp castiga)
-- sólo chats individuales: WhatsApp no permite abrir grupos así
-- avisa si es un número con el que nunca hablaste
-- **botón de emergencia:** `touch ~/.wacrawl/STOP` frena todo; borrás ese archivo y vuelve
-
-Las podés ajustar en `~/.wacrawl/limites.json`, por ejemplo `{"porHora": 40, "antiDifusion": false}`.
-Claves: `porMinuto`, `porHora`, `largoMax`, `antiDifusion`, `colaMax`, `colaEsperaMin`.
-
-> **Ojo con los mensajes en frío.** Que lo mandes vos a mano evita el riesgo de usar un cliente no
-> oficial, pero WhatsApp igual puede restringir un número si muchos desconocidos lo bloquean o lo
-> reportan. Poco volumen y mensajes realmente personalizados.
-
-## Importar años de historia desde el iPhone (opcional)
-
-WhatsApp Desktop sólo recibe alrededor de un año al vincularse, y no hay forma de pedirle más. El
-iPhone tiene todo. Con un backup del iPhone por cable se importa el resto, **una vez**, a un archivo
-aparte (`~/.wacrawl/historico`); Claude busca en los dos como si fueran uno.
-
-**Antes de arrancar, lo que no se puede o cuesta:**
-
-- **Sólo iPhone.** En Android el backup está cifrado de otra forma y este script no lo lee.
-- **El backup de WhatsApp en iCloud no sirve** (cifrado, sin acceso). Tiene que ser el de Finder.
-- **Finder copia el iPhone entero**, no sólo WhatsApp. Es temporal, pero tiene que entrar en el
-  disco: mirá en el iPhone *Ajustes → General → Almacenamiento* cuánto usás. Si no entra, liberá
-  espacio antes.
-- **De los adjuntos viejos vuelven sólo los que el iPhone tenga guardados.** Por defecto quedan
-  afuera videos y stickers (suelen ser la mitad del espacio y Claude no los puede mirar).
-- **Es una foto fija**: lo que llega después del backup entra por el sync de siempre.
-
-**Pasos:**
-
-1. En Finder, con el iPhone conectado: *Hacer copia de seguridad de todos los datos del iPhone en
-   esta Mac*, **sin** tildar *Cifrar copia local* (si está tildado, destildalo para esta copia;
-   Finder te pide la contraseña). *Hacer copia ahora*.
-2. macOS no deja que un script lea esa copia donde Finder la guarda. Abrila y movela:
+1. In Finder, with the iPhone connected: *Back up all of the data on your iPhone to this Mac*,
+   **without** *Encrypt local backup* (if it's ticked, untick it for this backup; Finder asks for the
+   password). *Back Up Now*.
+2. macOS won't let a script read the backup where Finder keeps it. Open it and move it:
    ```bash
-   mkdir -p ~/backup-iphone && open ~/backup-iphone && open ~/Library/Application\ Support/MobileSync/Backup
+   mkdir -p ~/iphone-backup && open ~/iphone-backup && open ~/Library/Application\ Support/MobileSync/Backup
    ```
-   Arrastrá la carpeta del backup (nombre largo tipo `00008140-…`, la de fecha más nueva) a
-   `backup-iphone`. Es instantáneo y no ocupa espacio extra.
-3. Importá (tarda unos 15 minutos; `--con-videos` si querés todo):
+   Drag the backup folder (a long name like `00008140-…`, the newest one) to `iphone-backup`. It's
+   instant and takes no extra space.
+3. Import it (about 15 minutes; add `--with-videos` if you want everything):
    ```bash
-   ~/wacrawl-mcp/importar-iphone.sh ~/backup-iphone/<carpeta>
+   ~/wacrawl-mcp/import-iphone.sh ~/iphone-backup/<folder>
    ```
-4. Borrá el backup: seleccioná la carpeta en Finder y ⌥⌘⌫. Lo de WhatsApp ya quedó afuera.
+4. Delete the backup: select the folder in Finder and press ⌥⌘⌫. The WhatsApp part has already been taken out.
 
-Los audios viejos no se transcriben solos: Claude los transcribe a pedido. Para hacerlos todos, dejá
-la Mac enchufada y con la tapa abierta una o varias noches (una M4 transcribe unas 10 veces más rápido
-de lo que dura el audio: 300 horas de audio son más de un día). Va del más nuevo al más viejo, se
-puede parar y retoma donde quedó:
+Old voice notes aren't transcribed on their own: Claude transcribes them on demand. To do them all,
+leave the Mac plugged in with the lid open for one or several nights (an M4 transcribes about 10× faster
+than the audio lasts: 300 hours of audio take more than a day). It goes from newest to oldest, can be
+stopped, and resumes where it left off:
 
 ```bash
-~/wacrawl-mcp/transcribir-historico.sh                   # o con fecha: … 1 2026-01-01 (sólo lo anterior)
-~/wacrawl-mcp/transcribir-historico.sh estado            # cuánto va, por año
-~/wacrawl-mcp/transcribir-historico.sh parar
+~/wacrawl-mcp/transcribe-history.sh                  # or with a date: … 1 2026-01-01 (only older ones)
+~/wacrawl-mcp/transcribe-history.sh status           # progress, per year
+~/wacrawl-mcp/transcribe-history.sh stop
 ```
 
-## Lo que no hace (y conviene saber)
+## What it doesn't do (worth knowing)
 
-- **No tiene todo tu historial** salvo que [importes el del iPhone](#importar-años-de-historia-desde-el-iphone-opcional).
-  Tiene lo que WhatsApp Desktop recibió del teléfono al vincularse (suele ser alrededor de un año)
-  más todo lo que llegó desde entonces. Si algo viejo no aparece, no está en tu Mac.
-- **El archivo va hasta 6 horas atrás.** Actualizarlo tarda minutos, así que se hace en segundo
-  plano. Para lo de último momento, Claude lee WhatsApp en vivo (necesita el permiso del paso 2).
-- **En grupos grandes, muchos mensajes no tienen nombre de quién los mandó**: WhatsApp no guarda el
-  nombre de la gente que no tenés agendada. Los chats individuales no tienen este problema.
-- **Sólo hay archivos (fotos, PDFs, documentos) desde que vinculaste WhatsApp Desktop**, salvo los
-  que traiga un [histórico del iPhone](#importar-años-de-historia-desde-el-iphone-opcional). Los Word
-  se leen completos; los Excel hay que exportarlos.
-- **Los audios se transcriben sólo si instalás la [transcripción local](#notas-de-voz-opcional)**; si no, sabe que existen pero no qué dicen.
-- **Para preparar un mensaje necesita el número de teléfono.** Funciona con tus contactos agendados;
-  para gente no agendada WhatsApp oculta el número, y tenés que pasárselo vos.
-- Si alguien está agendado con un apodo, buscalo por cómo lo tenés agendado.
+- **It doesn't have your whole history** unless you [import the iPhone's](#import-years-of-history-from-your-iphone-optional).
+  It has what WhatsApp Desktop received from the phone when it was linked (usually about a year) plus
+  everything since. If something old doesn't show up, it isn't on your Mac.
+- **The archive can be up to 6 hours behind.** Updating it takes minutes, so it happens in the
+  background. For anything very recent, Claude reads WhatsApp live (that needs the permission from step 2).
+- **In big groups, many messages have no sender name**: WhatsApp doesn't store the names of people who
+  aren't in your contacts. One-to-one chats don't have this problem.
+- **Files (photos, PDFs, documents) only exist since you linked WhatsApp Desktop**, plus the ones an
+  [iPhone history](#import-years-of-history-from-your-iphone-optional) brings back. Word files are read in
+  full; Excel files have to be exported.
+- **Voice notes are only transcribed if you install [local transcription](#voice-notes-optional)**;
+  otherwise Claude knows they exist but not what they say.
+- **Drafting or sending needs the phone number.** It works with your saved contacts; for people you
+  haven't saved, WhatsApp hides the number and you have to give it.
+- If someone is saved under a nickname, look them up the way you saved them.
 
-## Problemas comunes
+## Troubleshooting
 
-| Síntoma | Qué hacer |
+| Symptom | What to do |
 |---|---|
-| No aparece en Claude | Cerrá con **⌘Q**, corré `register.sh`, abrí. Si lo registraste con Claude abierto, se borró al cerrar. |
-| macOS pregunta *"node would like to access data from other apps"* cada vez | Falta el paso 2 (o se le dio el permiso a otro node). Tiene que ser la ruta que termina en `/runtime/bin/node`. |
-| Un audio aparece como "(audio)" sin texto | Todavía no se transcribió (la primera pasada tarda horas) o no está instalada: `check.sh audios`. Pedile a Claude que lo transcriba. |
-| Claude dice que no puede enviar | Está apagado (`activar-envio.sh`) o falta el permiso de Accesibilidad: el mensaje de error dice cuál. |
-| La cola no pasa al siguiente | Necesita el permiso del paso 2 para detectar que mandaste. Pedile *"estado de la cola"*: te dice por qué se pausó. |
-| Las respuestas parecen viejas | `check.sh` → sección "Salud del sync". El sync se repara solo si WhatsApp renumeró su base; si no, te avisa con una notificación. |
-| "No encontré ningún chat" con alguien que sí tenés | Está agendado con otro nombre o un apodo. Decile cómo lo tenés agendado. |
+| It doesn't show up in Claude | Quit with **⌘Q**, run `register.sh`, open Claude. If you registered it with Claude open, quitting erased it. |
+| macOS asks *"node would like to access data from other apps"* every time | Step 2 is missing (or the permission went to another node). It has to be the path ending in `/runtime/bin/node`. |
+| A voice note shows as "(audio)" with no text | It hasn't been transcribed yet (the first pass takes hours) or transcription isn't installed: `check.sh audio`. Ask Claude to transcribe it. |
+| Claude says it can't send | Sending is off (`enable-sending.sh`) or the Accessibility permission is missing: the error says which. |
+| The queue doesn't move on to the next one | It needs the permission from step 2 to see that you sent it. Ask for the *"queue status"*: it tells you why it paused. |
+| Answers look stale | `check.sh` → "Sync health". The sync repairs itself if WhatsApp renumbered its database; otherwise it sends you a notification. |
+| "No chat matches" for someone you do have | They're saved under another name or a nickname. Tell Claude how you saved them. |
 
-Registro del sync automático: `~/.wacrawl/wrapper.log`.
+Automatic sync log: `~/.wacrawl/wrapper.log`.
 
-## Actualizar
+## Update
 
 ```bash
 cd ~/wacrawl-mcp && git pull
 ```
 
-Cerrá y abrí Claude Desktop (⌘Q). No hace falta volver a registrar ni a dar permisos.
+Quit and reopen Claude Desktop (⌘Q). There's no need to register again or to grant the permissions again.
 
-## Desinstalar
+## Uninstall
 
 ```bash
-launchctl bootout gui/$(id -u)/com.openclaw.wacrawl.sync
-rm ~/Library/LaunchAgents/com.openclaw.wacrawl.sync.plist
+launchctl bootout gui/$(id -u)/io.github.renzactus.wacrawl-mcp.sync
+rm ~/Library/LaunchAgents/io.github.renzactus.wacrawl-mcp.sync.plist
 ```
 
-Con Claude cerrado, sacá el bloque `"wacrawl"` de
-`~/Library/Application Support/Claude/claude_desktop_config.json`, y quitá la entrada de node en
-Acceso total al disco. Tu archivo de WhatsApp queda en `~/.wacrawl/`: borralo sólo si estás seguro,
-porque puede tener mensajes que tu WhatsApp ya no tiene.
+With Claude quit, remove the `"wacrawl"` block from
+`~/Library/Application Support/Claude/claude_desktop_config.json`, and remove the node entry from Full
+Disk Access (and from Accessibility, if you turned on sending). Your WhatsApp archive stays in
+`~/.wacrawl/`: delete it only if you're sure, because it may have messages your WhatsApp no longer has.
 
-## Windows o Linux
+## Windows or Linux
 
-Esto depende de leer los archivos de WhatsApp Desktop para Mac. Para Windows/Linux, el mismo autor
-de wacrawl tiene [wacli](https://github.com/openclaw/wacli): se vincula como dispositivo por QR,
-guarda todo en SQLite local y tiene binarios para Windows. Encima se puede montar un server como este.
+This depends on reading the files of WhatsApp Desktop for Mac. For Windows and Linux, the makers of
+wacrawl also have [wacli](https://github.com/openclaw/wacli): it links as a device with a QR code, keeps
+everything in a local SQLite database and has Windows binaries. A server like this one could be built
+on top of it.
 
----
+## Credits
 
-Cómo está hecho, por qué de cada decisión, y lo que cuesta caro volver a descubrir:
-[NOTAS-TECNICAS.md](NOTAS-TECNICAS.md).
+- [wacrawl](https://github.com/openclaw/wacrawl) by OpenClaw (MIT) builds and syncs the local archive.
+  The installer downloads it from its official releases and checks its checksum; it isn't bundled here.
+- [Whisper](https://github.com/openai/whisper) by OpenAI (MIT), run through Apple's
+  [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (MIT), does the transcription.
+- [uv](https://github.com/astral-sh/uv) by Astral (MIT or Apache-2.0) fetches Python and the
+  transcription libraries.
+
+How it's built, why each decision was made, and the things that are expensive to rediscover:
+[TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
+
+## License
+
+[MIT](LICENSE) © 2026 Renzo Costanzo

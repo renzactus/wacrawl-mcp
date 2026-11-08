@@ -2,22 +2,22 @@
 'use strict';
 
 /**
- * wacrawl-mcp — MCP server (stdio) sobre el archivo local de WhatsApp.
+ * wacrawl-mcp — an MCP server (stdio) over your local WhatsApp archive.
  *
- * Todo local. Sin dependencias npm, sin red.
+ * Everything runs locally. No npm dependencies, no network.
  *
- * Todas las lecturas van por `wacrawl sql`, que es de sólo lectura (rechaza
- * cualquier cosa que no sea un único SELECT) y tarda ~1-3s. Deliberadamente NO
- * usamos los subcomandos `chats` / `messages` / `search`: hacen un "backfill"
- * que escribe en la base y tardan MINUTOS sobre un archivo de cientos de miles de mensajes,
- * lo que hacía que Claude Desktop cortara por timeout. Además `search` devuelve
- * muchísimos menos resultados que consultar el índice FTS directo.
+ * Every read goes through `wacrawl sql`, which is read-only (it rejects anything
+ * that isn't a single SELECT) and takes ~1-3 s. We deliberately do NOT use the
+ * `chats` / `messages` / `search` subcommands: they run a "backfill" that writes
+ * to the database and takes MINUTES on an archive of hundreds of thousands of
+ * messages, which made Claude Desktop time out. `search` also returns far fewer
+ * results than querying the FTS index directly.
  *
- * El archivo se mantiene fresco con el agente de launchd (`wacrawl sync` cada
- * 6h), no desde acá: nunca escribimos ni movemos ~/.wacrawl/wacrawl.db.
+ * The archive is kept fresh by the launchd agent (a sync every 6 h), not from
+ * here: this server never writes or moves ~/.wacrawl/wacrawl.db.
  */
 
-const { execFile } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -41,7 +41,7 @@ function execWacrawl(args) {
     execFile(WACRAWL_BIN, args, { maxBuffer: MAX_BUFFER, timeout: TIMEOUT_MS }, (err, stdout, stderr) => {
       if (err) {
         const detail = (stderr || stdout || err.message).toString().trim();
-        reject(new Error(`wacrawl falló: ${detail}`));
+        reject(new Error(`wacrawl failed: ${detail}`));
         return;
       }
       resolve(stdout.toString());
@@ -52,11 +52,11 @@ function execWacrawl(args) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isLocked = (err) => /database is locked|SQLITE_BUSY/i.test(err.message || '');
 
-/** Serializa las llamadas y reintenta si el sync de launchd tiene la base tomada. */
-let queue = Promise.resolve();
+/** Serializes calls, and retries if the launchd sync is holding the database. */
+let wacrawlQueue = Promise.resolve();
 
 function runWacrawl(args) {
-  const result = queue.then(async () => {
+  const result = wacrawlQueue.then(async () => {
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await execWacrawl(args);
@@ -66,11 +66,11 @@ function runWacrawl(args) {
       }
     }
   });
-  queue = result.then(() => {}, () => {});
+  wacrawlQueue = result.then(() => {}, () => {});
   return result;
 }
 
-/** Ejecuta un SELECT y devuelve las filas. `--sync never` = lectura pura. Sin `db`, el archivo principal. */
+/** Runs a SELECT and returns the rows. `--sync never` = pure read. Without `db`, the main archive. */
 async function runSQL(sql, db = null) {
   const out = await runWacrawl([...(db ? ['--db', db] : []), '--sync', 'never', '--json', 'sql', sql]);
   const trimmed = out.trim();
@@ -79,83 +79,96 @@ async function runSQL(sql, db = null) {
   try {
     parsed = JSON.parse(trimmed);
   } catch {
-    throw new Error(`wacrawl devolvió una salida no-JSON: ${trimmed.slice(0, 400)}`);
+    throw new Error(`wacrawl returned non-JSON output: ${trimmed.slice(0, 400)}`);
   }
   return (Array.isArray(parsed) ? parsed : [parsed]).filter((r) => r && typeof r === 'object');
 }
 
 /* ------------------------------------------------------------------ */
-/* histórico del iPhone: un segundo archivo, fijo, con los años viejos  */
+/* iPhone history: a second, frozen archive with the older years       */
 /* ------------------------------------------------------------------ */
 
 /**
- * WhatsApp Desktop recibe ~1 año de historia al vincularse. Los años anteriores se importan
- * una vez desde un backup del iPhone (importar-iphone.sh) a un archivo APARTE: cuando WhatsApp
- * renumera, el sync reconstruye el principal entero con lo que tiene Desktop, y se llevaría
- * puesto lo importado.
+ * WhatsApp Desktop receives ~1 year of history when it's linked. Older years are imported
+ * once from an iPhone backup (import-iphone.sh) into a SEPARATE archive: when WhatsApp
+ * renumbers, the sync rebuilds the main archive from scratch with what Desktop has, and
+ * would wipe out anything imported into it.
  *
- * Los dos se solapan en el último año, así que cada uno responde sólo su tramo: el histórico
- * antes de `corte`, el principal desde `corte` (el primer mes en que el principal ya está
- * completo). Así los conteos suman sin duplicar.
+ * The two overlap in the last year, so each one answers only for its own range: the history
+ * archive before the cutoff, the main archive from the cutoff on (the first month in which
+ * the main archive is already complete). That way counts add up without duplicates.
+ *
+ * On-disk names (`historico/`, `corte.json` and its keys) come from the original Spanish
+ * version and are kept so existing installs keep working.
  */
-const HISTORICO_DIR = process.env.WACRAWL_HISTORICO_DIR || path.join(os.homedir(), '.wacrawl/historico');
+const HISTORY_DIR = process.env.WACRAWL_HISTORY_DIR || path.join(os.homedir(), '.wacrawl/historico');
 
-function historico() {
+function historyArchive() {
   try {
-    const info = JSON.parse(fs.readFileSync(path.join(HISTORICO_DIR, 'corte.json'), 'utf8'));
-    const db = path.join(HISTORICO_DIR, 'wacrawl.db');
-    if (Number.isFinite(info.corte) && fs.existsSync(db)) return { ...info, db };
+    const info = JSON.parse(fs.readFileSync(path.join(HISTORY_DIR, 'corte.json'), 'utf8'));
+    const db = path.join(HISTORY_DIR, 'wacrawl.db');
+    if (Number.isFinite(info.corte) && fs.existsSync(db)) {
+      return {
+        db,
+        cutoff: info.corte,
+        cutoffDate: info.corteFecha,
+        since: info.desde,
+        backup: info.backup,
+        noVideos: Boolean(info.sinVideos),
+        attachmentsSince: info.adjuntosDesde || null,
+      };
+    }
   } catch {}
   return null;
 }
 
-/** Hasta dónde llega la historia en ESTA Mac, para las instrucciones del server. */
-function profundidad() {
-  const h = historico();
+/** How far back history goes on THIS Mac, for the server instructions. */
+function depthNote() {
+  const h = historyArchive();
   if (!h) {
-    return 'el archivo tiene lo que WhatsApp Desktop recibió del teléfono al vincularse, más todo lo que llegó después. Suele cubrir meses, no años.';
+    return 'the archive has what WhatsApp Desktop received from the phone when it was linked, plus everything that arrived since. That is usually months, not years.';
   }
-  return `además de lo que WhatsApp Desktop recibió al vincularse, en esta Mac se importó la historia del iPhone ` +
-    `(backup del ${h.backup}): las búsquedas cubren desde ${h.desde}. Lo que llegó después de ese backup entra por el sync normal. ` +
-    `Los adjuntos viejos son los que el iPhone tenía guardados${h.sinVideos ? ' (sin videos ni stickers)' : ''}. ` +
-    `Los audios de antes del ${h.corteFecha} pueden no estar transcriptos: transcribir_audios los transcribe a pedido.`;
+  return `besides what WhatsApp Desktop received when it was linked, the iPhone history was imported on this Mac ` +
+    `(backup from ${h.backup}): searches go back to ${h.since}. Anything after that backup comes in through the normal sync. ` +
+    `Old attachments are the ones the iPhone still had${h.noVideos ? ' (no videos or stickers)' : ''}. ` +
+    `Voice notes from before ${h.cutoffDate} may not be transcribed yet: transcribe_audio transcribes them on demand.`;
 }
 
-/** Qué adjuntos existen en esta Mac, para explicar por qué falta uno. */
-function queArchivosHay() {
-  const h = historico();
+/** Which attachments exist on this Mac, to explain why one is missing. */
+function filesNote() {
+  const h = historyArchive();
   if (!h) {
-    return 'Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac;' +
-      ' de mensajes anteriores existe el registro pero no el archivo.';
+    return 'Only the files WhatsApp Desktop downloaded since it was linked to this Mac exist;' +
+      ' for older messages the record exists but the file does not.';
   }
-  return `Sólo existen los archivos que WhatsApp Desktop descargó desde que se vinculó a esta Mac y los que el` +
-    ` iPhone tenía guardados al hacer el backup${h.adjuntosDesde ? ` (desde ${h.adjuntosDesde})` : ''}` +
-    `${h.sinVideos ? ', sin videos ni stickers' : ''}; de lo anterior existe el registro pero no el archivo.`;
+  return `Only the files WhatsApp Desktop downloaded since it was linked to this Mac exist, plus the ones the` +
+    ` iPhone still had when the backup was made${h.attachmentsSince ? ` (since ${h.attachmentsSince})` : ''}` +
+    `${h.noVideos ? ', without videos or stickers' : ''}; for anything older the record exists but the file does not.`;
 }
 
-/** La misma consulta en los dos archivos, cada uno en su tramo. `armar` recibe la condición de fecha. */
-function enAmbos(armar) {
-  const h = historico();
-  if (!h) return [runSQL(armar(''))];
-  return [runSQL(armar(` AND m.ts >= ${h.corte}`)), runSQL(armar(` AND m.ts < ${h.corte}`), h.db)];
+/** The same query on both archives, each on its own range. `build` receives the date condition. */
+function inBoth(build) {
+  const h = historyArchive();
+  if (!h) return [runSQL(build(''))];
+  return [runSQL(build(` AND m.ts >= ${h.cutoff}`)), runSQL(build(` AND m.ts < ${h.cutoff}`), h.db)];
 }
 
 /* ------------------------------------------------------------------ */
-/* fuente en vivo: la base de WhatsApp Desktop, ESTRICTAMENTE read-only */
+/* live source: the WhatsApp Desktop database, STRICTLY read-only      */
 /* ------------------------------------------------------------------ */
 
-/** CoreData cuenta segundos desde 2001-01-01, no desde 1970. */
+/** CoreData counts seconds from 2001-01-01, not 1970. */
 const APPLE_EPOCH = 978307200;
 
 let sourcePathPromise = null;
 
-/** Ruta de ChatStorage.sqlite, según el propio wacrawl (no la hardcodeamos). */
+/** Path to ChatStorage.sqlite, as reported by wacrawl itself (we don't hardcode it). */
 function sourcePath() {
   if (!sourcePathPromise) {
     sourcePathPromise = runWacrawl(['--sync', 'never', 'doctor'])
       .then((out) => {
         const chatDb = JSON.parse(out)?.desktop?.chat_db;
-        if (!chatDb) throw new Error('wacrawl doctor no reportó la ruta de WhatsApp Desktop.');
+        if (!chatDb) throw new Error('wacrawl doctor did not report the WhatsApp Desktop path.');
         return chatDb;
       })
       .catch((err) => {
@@ -167,16 +180,13 @@ function sourcePath() {
 }
 
 /**
- * Consulta la base VIVA de WhatsApp, a través del propio wacrawl.
+ * Queries the LIVE WhatsApp database, through wacrawl itself rather than /usr/bin/sqlite3,
+ * so every read has the same guarantees: wacrawl's `sql` rejects anything that isn't a single
+ * SELECT, and it has been verified not to modify WhatsApp's file.
  *
- * Va por wacrawl y no por /usr/bin/sqlite3 por un motivo concreto: macOS le
- * pedía permiso a NODE cada vez, porque node era quien abría el container de
- * WhatsApp. wacrawl ya tiene ese permiso concedido (es el que sincroniza), así
- * que usándolo el prompt desaparece — y de paso no hace falta darle acceso a
- * todo el disco a node, que sería mucho más amplio.
- *
- * `sql` de wacrawl rechaza todo lo que no sea un único SELECT, y está
- * verificado que no modifica el archivo de WhatsApp.
+ * Reading WhatsApp's container needs Full Disk Access, which macOS checks on the responsible
+ * process — the dedicated node runtime — not on the binary that opens the file
+ * (see TECHNICAL-NOTES.md, "macOS permissions").
  */
 async function runLiveSQL(sql) {
   const db = await sourcePath();
@@ -187,36 +197,36 @@ async function runLiveSQL(sql) {
     const parsed = JSON.parse(trimmed);
     return (Array.isArray(parsed) ? parsed : [parsed]).filter((r) => r && typeof r === 'object');
   } catch {
-    throw new Error(`wacrawl devolvió una salida inesperada: ${trimmed.slice(0, 300)}`);
+    throw new Error(`wacrawl returned unexpected output: ${trimmed.slice(0, 300)}`);
   }
 }
 
 /* ------------------------------------------------------------------ */
-/* media: convertir a algo que Claude pueda VER                        */
+/* media: turn attachments into something Claude can SEE               */
 /* ------------------------------------------------------------------ */
 
 const SIPS_BIN = '/usr/bin/sips';
 const MAX_PX = 1024;
 
 /**
- * Normaliza cualquier adjunto a JPEG para devolverlo como imagen por MCP.
+ * Normalizes any attachment to JPEG so it can be returned as an MCP image.
  *
- * Los PDF se RENDERIZAN a imagen en vez de extraerles el texto: macOS no trae
- * nada nativo para eso (Spotlight no indexa el container de WhatsApp y PyObjC
- * no está instalado), y renderizar sirve igual para PDFs escaneados, donde no
- * hay texto que extraer. `sips` viene con el sistema, así que cero dependencias.
+ * PDFs are RENDERED to an image instead of having their text extracted: macOS ships nothing
+ * native for that (Spotlight doesn't index WhatsApp's container and PyObjC isn't installed),
+ * and rendering works just as well for scanned PDFs, which have no text to extract. `sips`
+ * ships with the system, so: zero dependencies.
  *
- * Ojo: de un PDF sale SÓLO la primera página.
+ * Note: a PDF yields ONLY its first page.
  */
 async function renderToJpeg(srcPath) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wacrawl-media-'));
   const out = path.join(dir, 'out.jpg');
   try {
-    const ext = extensionDe(srcPath);
+    const ext = detectExtension(srcPath);
     if (ext && path.extname(srcPath).toLowerCase() !== ext) {
-      const conExt = path.join(dir, `in${ext}`);
-      fs.copyFileSync(srcPath, conExt);
-      srcPath = conExt;
+      const withExt = path.join(dir, `in${ext}`);
+      fs.copyFileSync(srcPath, withExt);
+      srcPath = withExt;
     }
     await new Promise((resolve, reject) => {
       execFile(
@@ -228,48 +238,48 @@ async function renderToJpeg(srcPath) {
     });
     return fs.readFileSync(out).toString('base64');
   } finally {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* no importa */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* doesn't matter */ }
   }
 }
 
-const EXT_SOPORTADAS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.heic', '.gif', '.pdf', '.tiff', '.bmp']);
+const RENDERABLE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.heic', '.gif', '.pdf', '.tiff', '.bmp']);
 
-/** Documentos que se pueden LEER como texto con textutil (viene con macOS, sin dependencias). */
-const EXT_TEXTO = new Set(['.docx', '.doc', '.rtf', '.odt', '.txt', '.html', '.htm']);
-const MAX_TEXTO = 20000;
+/** Documents that can be READ as text with textutil (ships with macOS, no dependencies). */
+const TEXT_EXTS = new Set(['.docx', '.doc', '.rtf', '.odt', '.txt', '.html', '.htm']);
+const MAX_TEXT = 20000;
 
-async function textoDeDocumento(srcPath) {
+async function documentText(srcPath) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wacrawl-doc-'));
   try {
-    // textutil decide el formato por la extensión: wacrawl 0.4.x guarda sin extensión.
-    const ext = extensionDe(srcPath);
-    const entrada = path.join(dir, `in${ext}`);
-    fs.copyFileSync(srcPath, entrada);
-    const texto = await new Promise((resolve, reject) => {
-      execFile('/usr/bin/textutil', ['-convert', 'txt', '-stdout', entrada], { maxBuffer: MAX_BUFFER, timeout: 30000 },
+    // textutil picks the format from the extension, and wacrawl 0.4.x stores files without one.
+    const ext = detectExtension(srcPath);
+    const input = path.join(dir, `in${ext}`);
+    fs.copyFileSync(srcPath, input);
+    const text = await new Promise((resolve, reject) => {
+      execFile('/usr/bin/textutil', ['-convert', 'txt', '-stdout', input], { maxBuffer: MAX_BUFFER, timeout: 30000 },
         (err, out, stderr) => (err ? reject(new Error((stderr || err.message).toString().trim())) : resolve(out.toString())));
     });
-    const limpio = texto.replace(/\n{3,}/g, '\n\n').trim();
-    return limpio.length > MAX_TEXTO
-      ? `${limpio.slice(0, MAX_TEXTO)}\n\n[… recortado: el documento sigue. Exportalo con exportar_archivo para tenerlo completo.]`
-      : limpio;
+    const clean = text.replace(/\n{3,}/g, '\n\n').trim();
+    return clean.length > MAX_TEXT
+      ? `${clean.slice(0, MAX_TEXT)}\n\n[… truncated: the document continues. Export it with export_attachments to get all of it.]`
+      : clean;
   } finally {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* no importa */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* doesn't matter */ }
   }
 }
 
 /**
- * Extensión real de un adjunto. wacrawl 0.3.x copiaba la media con su nombre
- * original (".../uuid.jpg"), pero 0.4.x la guarda por hash y SIN extensión
- * (".../media/46/4637a2f5…"), y no registra el tipo en ningún lado. Entonces,
- * si no hay extensión, la deducimos de los primeros bytes, como hace `file`.
+ * The real extension of an attachment. wacrawl 0.3.x copied media with its original name
+ * (".../uuid.jpg"), but 0.4.x stores it by hash and WITHOUT an extension
+ * (".../media/46/4637a2f5…"), and doesn't record the type anywhere. So if there's no
+ * extension, we infer it from the first bytes, the way `file` does.
  */
-function extensionDe(ruta) {
-  const ext = path.extname(ruta).toLowerCase();
+function detectExtension(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
   if (ext && ext.length <= 6) return ext;
   let b;
   try {
-    const fd = fs.openSync(ruta, 'r');
+    const fd = fs.openSync(filePath, 'r');
     b = Buffer.alloc(4096);
     const n = fs.readSync(fd, b, 0, 4096, 0);
     fs.closeSync(fd);
@@ -285,26 +295,26 @@ function extensionDe(ruta) {
   if (asc(0, 4) === 'RIFF' && asc(8, 4) === 'WEBP') return '.webp';
   if (asc(0, 4) === 'OggS') return '.opus';
   if (asc(4, 4) === 'ftyp') {
-    const marca = asc(8, 4);
-    if (['heic', 'heix', 'mif1', 'msf1'].includes(marca)) return '.heic';
-    if (marca === 'M4A ') return '.m4a';
-    if (marca === 'qt  ') return '.mov';
+    const brand = asc(8, 4);
+    if (['heic', 'heix', 'mif1', 'msf1'].includes(brand)) return '.heic';
+    if (brand === 'M4A ') return '.m4a';
+    if (brand === 'qt  ') return '.mov';
     return '.mp4';
   }
-  if (asc(0, 4) === 'PK\x03\x04') {          // Office moderno = zip
-    // El índice de un zip está al FINAL: miramos el principio y la cola.
-    let cola = Buffer.alloc(0);
+  if (asc(0, 4) === 'PK\x03\x04') {          // modern Office = zip
+    // A zip's index is at the END: look at the beginning and at the tail.
+    let tail = Buffer.alloc(0);
     try {
-      const fd = fs.openSync(ruta, 'r');
-      const tam = fs.fstatSync(fd).size;
-      cola = Buffer.alloc(Math.min(65536, tam));
-      fs.readSync(fd, cola, 0, cola.length, Math.max(0, tam - cola.length));
+      const fd = fs.openSync(filePath, 'r');
+      const size = fs.fstatSync(fd).size;
+      tail = Buffer.alloc(Math.min(65536, size));
+      fs.readSync(fd, tail, 0, tail.length, Math.max(0, size - tail.length));
       fs.closeSync(fd);
-    } catch { /* con el principio alcanza */ }
-    const cuerpo = b.toString('latin1') + cola.toString('latin1');
-    if (cuerpo.includes('word/')) return '.docx';
-    if (cuerpo.includes('xl/')) return '.xlsx';
-    if (cuerpo.includes('ppt/')) return '.pptx';
+    } catch { /* the beginning is enough */ }
+    const body = b.toString('latin1') + tail.toString('latin1');
+    if (body.includes('word/')) return '.docx';
+    if (body.includes('xl/')) return '.xlsx';
+    if (body.includes('ppt/')) return '.pptx';
     return '.zip';
   }
   if (/^\s*<(!doctype html|html)/i.test(asc(0, 64))) return '.html';
@@ -312,541 +322,566 @@ function extensionDe(ruta) {
 }
 
 /* ------------------------------------------------------------------ */
-/* borradores: el modelo redacta, la persona envía                     */
+/* drafts and sending: the model writes, the person decides            */
 /* ------------------------------------------------------------------ */
 
 /**
- * Nivel 1 de "enviar": NUNCA se envía nada. Se abre WhatsApp Desktop en el
- * chat con el texto escrito en la caja, y la persona aprieta Enter.
+ * By default nothing is ever sent: WhatsApp Desktop opens on the chat with the text typed
+ * in the box, and the person presses Enter. Real sending (send_message) is opt-in, per Mac.
  *
- * Las barreras viven acá y no en el prompt, porque un modelo que se desboca
- * ignora instrucciones pero no un `if`. Los límites se persisten en disco para
- * que reiniciar el server no los resetee.
+ * The safeguards live here and not in the prompt, because a runaway model ignores
+ * instructions but not an `if`. The counters are persisted on disk so restarting the server
+ * doesn't reset them.
  */
-// Overridables sólo para test (check.sh): carpeta de estado y comando que abre.
+// Overridable for tests only (check.sh): the state folder and the command that opens WhatsApp.
 const DRAFTS_DIR = process.env.WACRAWL_DRAFTS_DIR || path.join(os.homedir(), '.wacrawl');
 const OPEN_BIN = process.env.WACRAWL_OPEN_BIN || '/usr/bin/open';
+// "borradores" means drafts: the name predates the English version and is kept for existing installs.
 const DRAFTS_LOG = path.join(DRAFTS_DIR, 'borradores.jsonl');
 const KILL_SWITCH = path.join(DRAFTS_DIR, 'STOP');
-const LIMITES_DEFAULT = {
-  porMinuto: 3,          // borradores sueltos (preparar_mensaje)
-  porHora: 15,
-  largoMax: 2000,
-  ventanaDifusionMin: 60,
-  antiDifusion: true,    // mismo texto a otro chat → bloqueado
-  colaMax: 30,           // mensajes por cola
-  colaEsperaMin: 10,     // sin envío en este lapso → la cola se pausa
-  permitirEnvio: false,  // enviar_mensaje APRIETA ENTER: apagado salvo que la persona lo active
-  enviosPorHora: 10,
+const DEFAULT_LIMITS = {
+  perMinute: 3,           // single drafts (draft_message) and sends
+  perHour: 15,
+  maxLength: 2000,
+  broadcastWindowMin: 60,
+  antiBroadcast: true,    // same text to another chat → blocked
+  queueMax: 30,           // messages per queue
+  queueWaitMin: 10,       // nothing sent in this long → the queue pauses
+  allowSending: false,    // send_message PRESSES ENTER: off unless the person turns it on
+  sendsPerHour: 10,
+};
+// Keys used by the original Spanish version (~/.wacrawl/limites.json): still honored.
+const LEGACY_LIMIT_KEYS = {
+  porMinuto: 'perMinute', porHora: 'perHour', largoMax: 'maxLength', ventanaDifusionMin: 'broadcastWindowMin',
+  antiDifusion: 'antiBroadcast', colaMax: 'queueMax', colaEsperaMin: 'queueWaitMin',
+  permitirEnvio: 'allowSending', enviosPorHora: 'sendsPerHour',
 };
 /**
- * Se pueden ajustar en ~/.wacrawl/limites.json (ej. {"porHora": 40}). Es
- * decisión de la persona: el riesgo de que WhatsApp restrinja la cuenta es
- * suyo. Lo que NO es ajustable es que nunca se envía nada solo.
+ * Adjustable in ~/.wacrawl/limits.json (e.g. {"perHour": 40}). That's the person's call: the
+ * risk of WhatsApp restricting the account is theirs. What is NOT adjustable: a draft never
+ * sends itself, and send_message only works with "allowSending": true.
  */
-function cargarLimites() {
-  try {
-    const propio = JSON.parse(fs.readFileSync(path.join(DRAFTS_DIR, 'limites.json'), 'utf8'));
-    return { ...LIMITES_DEFAULT, ...propio };
-  } catch {
-    return { ...LIMITES_DEFAULT };
-  }
+function loadLimits() {
+  const read = (name) => {
+    try { return JSON.parse(fs.readFileSync(path.join(DRAFTS_DIR, name), 'utf8')) || {}; } catch { return {}; }
+  };
+  const legacy = Object.fromEntries(
+    Object.entries(read('limites.json'))
+      .filter(([k]) => k in LEGACY_LIMIT_KEYS)
+      .map(([k, v]) => [LEGACY_LIMIT_KEYS[k], v])
+  );
+  return { ...DEFAULT_LIMITS, ...legacy, ...read('limits.json') };
 }
-let LIMITES = cargarLimites();
+let LIMITS = loadLimits();
 
-function leerBorradores() {
+function readDraftLog() {
   try {
-    return fs.readFileSync(DRAFTS_LOG, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    return fs.readFileSync(DRAFTS_LOG, 'utf8').split('\n').filter(Boolean).flatMap((l) => {
+      try { return [JSON.parse(l)]; } catch { return []; }   // a damaged line must not reset the limits
+    });
   } catch {
     return [];
   }
 }
 
-const normalizarTexto = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').trim();
+// Entries written by the original Spanish version use telefono / texto / envio.
+const entryPhone = (d) => d.phone ?? d.telefono;
+const entryText = (d) => d.text ?? d.texto;
+const entryIsSend = (d) => Boolean(d.send ?? d.envio);
 
-/** Devuelve el motivo del bloqueo, o null si se puede abrir el borrador. */
-function chequearBarreras(telefono, texto, { enCola = false } = {}) {
-  LIMITES = cargarLimites();
+const normalizeText = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').trim();
+
+/** Returns why it's blocked, or null if the draft can be opened. mode: 'draft' | 'queue' | 'send'. */
+function checkSafeguards(phone, text, { mode = 'draft' } = {}) {
+  LIMITS = loadLimits();
   if (fs.existsSync(KILL_SWITCH)) {
-    return `Borradores DESACTIVADOS: existe ${KILL_SWITCH}. Borrá ese archivo para reactivarlos.`;
+    return `Drafts are DISABLED: ${KILL_SWITCH} exists. Delete that file to turn them back on.`;
   }
-  const ahora = Date.now();
-  const previos = leerBorradores();
-  const enVentana = (min) => previos.filter((b) => ahora - b.ts < min * 60000);
+  const now = Date.now();
+  const previous = readDraftLog();
+  const inWindow = (min) => previous.filter((d) => now - d.ts < min * 60000);
 
-  if ((!enCola || enCola === 'envio') && enVentana(1).length >= LIMITES.porMinuto) {
-    return `Límite: máximo ${LIMITES.porMinuto} borradores por minuto. Esperá un momento.`;
+  if (mode !== 'queue' && inWindow(1).length >= LIMITS.perMinute) {
+    return `Limit: at most ${LIMITS.perMinute} drafts per minute. Wait a moment.`;
   }
-  if (enCola === 'envio' && enVentana(60).filter((b) => b.envio).length >= LIMITES.enviosPorHora) {
-    return `Límite: máximo ${LIMITES.enviosPorHora} envíos por hora. Esto frena una ráfaga; se libera solo (ajustable en ~/.wacrawl/limites.json).`;
+  if (mode === 'send' && inWindow(60).filter(entryIsSend).length >= LIMITS.sendsPerHour) {
+    return `Limit: at most ${LIMITS.sendsPerHour} sends per hour. This stops bursts and clears on its own (adjustable in ~/.wacrawl/limits.json).`;
   }
-  if (enVentana(60).length >= LIMITES.porHora) {
-    return `Límite: máximo ${LIMITES.porHora} borradores por hora. Esto frena una ráfaga; se libera solo.`;
+  if (inWindow(60).length >= LIMITS.perHour) {
+    return `Limit: at most ${LIMITS.perHour} drafts per hour. This stops bursts and clears on its own.`;
   }
-  // Anti-difusión: el mismo texto a OTRO destinatario es el patrón de un
-  // broadcast, que es lo que hace que WhatsApp banee cuentas.
-  const t = normalizarTexto(texto);
-  const repetido = LIMITES.antiDifusion &&
-    enVentana(LIMITES.ventanaDifusionMin).find((b) => b.texto === t && b.telefono !== telefono);
-  if (repetido) {
-    return `Bloqueado: ese mismo texto ya se preparó para otro chat (${repetido.chat}) en la última hora. No se arman difusiones.`;
+  // Anti-broadcast: the same text to ANOTHER recipient is what a broadcast looks like, and
+  // broadcasts are what get WhatsApp accounts banned.
+  const t = normalizeText(text);
+  const repeated = LIMITS.antiBroadcast &&
+    inWindow(LIMITS.broadcastWindowMin).find((d) => entryText(d) === t && entryPhone(d) !== phone);
+  if (repeated) {
+    return `Blocked: that same text was already drafted for another chat (${repeated.chat}) in the last hour. No broadcasts.`;
   }
   return null;
 }
 
-function registrarBorrador(entrada) {
+function logDraft(entry) {
   fs.mkdirSync(path.dirname(DRAFTS_LOG), { recursive: true });
-  fs.appendFileSync(DRAFTS_LOG, JSON.stringify(entrada) + '\n');
+  fs.appendFileSync(DRAFTS_LOG, JSON.stringify(entry) + '\n');
 }
 
-/** Teléfono (sólo dígitos) de un chat, o error explicando por qué no hay. */
-async function telefonoDeChat(chat) {
-  const valor = String(chat).trim();
+/** The phone number (digits only) for a chat, or an error explaining why there isn't one. */
+async function recipientFor(chat) {
+  const value = String(chat).trim();
 
-  // Número escrito directamente
-  const digitos = valor.replace(/[\s\-().]/g, '').replace(/^\+/, '');
-  if (/^\d{8,15}$/.test(digitos)) {
-    const [previo] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(`${digitos}@s.whatsapp.net`)} LIMIT 1`);
-    return { telefono: digitos, jid: `${digitos}@s.whatsapp.net`, nombre: previo?.name || `+${digitos}`, conocido: Boolean(previo) };
+  // A number typed directly
+  const digits = value.replace(/[\s\-().]/g, '').replace(/^\+/, '');
+  if (/^\d{8,15}$/.test(digits)) {
+    const [prev] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(`${digits}@s.whatsapp.net`)} LIMIT 1`);
+    return { phone: digits, jid: `${digits}@s.whatsapp.net`, name: prev?.name || `+${digits}`, known: Boolean(prev) };
   }
 
-  const jid = await resolveChatJID(valor);
-  const [fila] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(jid)} LIMIT 1`);
-  const nombre = fila?.name || valor;
+  const jid = await resolveChatJID(value);
+  const [row] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(jid)} LIMIT 1`);
+  const name = row?.name || value;
 
   if (jid.endsWith('@g.us')) {
-    throw new Error(`"${nombre}" es un grupo. WhatsApp sólo permite abrir chats individuales por enlace: abrí el grupo a mano.`);
+    throw new Error(`"${name}" is a group. WhatsApp only opens one-to-one chats through a link: open the group by hand.`);
   }
   if (jid.endsWith('@s.whatsapp.net')) {
-    return { telefono: jid.split('@')[0], jid, nombre, conocido: true };
+    return { phone: jid.split('@')[0], jid, name, known: true };
   }
   if (jid.endsWith('@lid')) {
     const [ct] = await runSQL(
       `SELECT jid FROM contacts WHERE lid = ${sqlString(jid)} AND deleted_at IS NULL AND jid LIKE '%@s.whatsapp.net' LIMIT 1`
     );
-    if (ct) return { telefono: ct.jid.split('@')[0], jid, nombre, conocido: true };
+    if (ct) return { phone: ct.jid.split('@')[0], jid, name, known: true };
     throw new Error(
-      `No tengo el número de "${nombre}": no está en tu agenda y WhatsApp oculta el número de los no agendados. ` +
-      `Si lo sabés, pasámelo directamente.`
+      `I don't have the number for "${name}": they're not in your contacts, and WhatsApp hides the number of people you haven't saved. ` +
+      `If you know it, give it to me directly.`
     );
   }
-  throw new Error(`"${nombre}" no es un chat individual.`);
+  throw new Error(`"${name}" is not a one-to-one chat.`);
 }
 
 /**
- * Envío real: aprieta Enter en WhatsApp Desktop (la app oficial, así no hay riesgo de bloqueo por
- * usar un cliente no oficial). Antes verifica que WhatsApp sea la app al frente: si el foco se fue
- * a otra ventana, el Enter caería ahí. Necesita permiso de Accesibilidad para el proceso
- * responsable (el runtime de node); sin él macOS rechaza el keystroke y se avisa cómo darlo.
+ * Real sending: presses Enter in WhatsApp Desktop (the official app, so there's no
+ * unofficial-client risk). First it checks that WhatsApp is the frontmost app: if focus
+ * moved to another window, the Enter would land there. It needs the Accessibility permission
+ * for the responsible process (the node runtime); without it macOS rejects the keystroke and
+ * we say how to grant it.
  */
-const ENTER_BIN = process.env.WACRAWL_ENTER_BIN || null;   // sólo para test
+const ENTER_BIN = process.env.WACRAWL_ENTER_BIN || null;   // tests only
 
-const SCRIPT_ENTER = `
+const ENTER_SCRIPT = `
 tell application "WhatsApp" to activate
 delay 0.4
 tell application "System Events"
-  set frente to name of first application process whose frontmost is true
-  if frente is not "WhatsApp" then error "frente:" & frente
+  set frontApp to name of first application process whose frontmost is true
+  if frontApp is not "WhatsApp" then error "frontmost:" & frontApp
   key code 36
 end tell`;
 
-function presionarEnter() {
+function pressEnter() {
   return new Promise((resolve, reject) => {
-    const [bin, args] = ENTER_BIN ? [ENTER_BIN, []] : ['/usr/bin/osascript', ['-e', SCRIPT_ENTER]];
+    const [bin, args] = ENTER_BIN ? [ENTER_BIN, []] : ['/usr/bin/osascript', ['-e', ENTER_SCRIPT]];
     execFile(bin, args, { timeout: 15000 }, (err, _out, stderr) => {
       if (!err) return resolve();
       const msg = String(stderr || err.message);
-      if (/frente:/.test(msg)) {
-        const app = msg.split('frente:')[1].split('(')[0].trim();
-        reject(new Error(`No envié: WhatsApp no quedó al frente (estaba ${app}), y el Enter habría caído ahí. El mensaje quedó escrito en WhatsApp sin enviar.`));
+      if (/frontmost:/.test(msg)) {
+        const app = msg.split('frontmost:')[1].split('(')[0].trim();
+        reject(new Error(`Not sent: WhatsApp didn't stay in front (${app} was), and the Enter would have landed there. The message is typed in WhatsApp, unsent.`));
       } else if (/1002|not allowed to send keystrokes|assistive/i.test(msg)) {
         reject(new Error(
-          'No envié: macOS no le da permiso de Accesibilidad a este server para apretar Enter. ' +
-          'El usuario tiene que ir a Ajustes del Sistema → Privacidad y seguridad → Accesibilidad → + → ⌘⇧G → ' +
-          `${process.execPath} → activarlo. El mensaje quedó escrito en WhatsApp sin enviar.`
+          "Not sent: macOS doesn't give this server the Accessibility permission it needs to press Enter. " +
+          'The user has to go to System Settings → Privacy & Security → Accessibility → + → ⌘⇧G → ' +
+          `${process.execPath} → turn it on. The message is typed in WhatsApp, unsent.`
         ));
-      } else if (/-1743|not authorized to send apple events|no autorizado/i.test(msg)) {
+      } else if (/-1743|not authorized to send apple events|no autorizado/i.test(msg)) {   // macOS errors can be localized
         reject(new Error(
-          'No envié: macOS no le permite a este server controlar "System Events". El usuario tiene que ir a ' +
-          'Ajustes del Sistema → Privacidad y seguridad → Automatización y activar System Events para node. ' +
-          'El mensaje quedó escrito en WhatsApp sin enviar.'
+          'Not sent: macOS doesn\'t allow this server to control "System Events". The user has to go to ' +
+          'System Settings → Privacy & Security → Automation and turn on System Events for node. ' +
+          'The message is typed in WhatsApp, unsent.'
         ));
       } else {
-        reject(new Error(`No envié: ${msg.trim().slice(0, 200)}. El mensaje quedó escrito en WhatsApp sin enviar.`));
+        reject(new Error(`Not sent: ${msg.trim().slice(0, 200)}. The message is typed in WhatsApp, unsent.`));
       }
     });
   });
 }
 
-/** Abre WhatsApp en el chat con el texto escrito. No envía. */
-async function abrirBorrador({ telefono, nombre }, cuerpo, extra = {}) {
-  const url = `whatsapp://send?phone=${telefono}&text=${encodeURIComponent(cuerpo)}`;
+/** Opens WhatsApp on the chat with the text typed in. Doesn't send. */
+async function openDraft({ phone, name }, body, extra = {}) {
+  const url = `whatsapp://send?phone=${phone}&text=${encodeURIComponent(body)}`;
   await new Promise((resolve, reject) => {
     execFile(OPEN_BIN, [url], { timeout: 15000 }, (err, _out, stderr) =>
-      err ? reject(new Error(`No pude abrir WhatsApp: ${(stderr || err.message).toString().trim()}`)) : resolve()
+      err ? reject(new Error(`Couldn't open WhatsApp: ${(stderr || err.message).toString().trim()}`)) : resolve()
     );
   });
-  registrarBorrador({ ts: Date.now(), telefono, chat: nombre, texto: normalizarTexto(cuerpo), ...extra });
+  logDraft({ ts: Date.now(), phone, chat: name, text: normalizeText(body), ...extra });
 }
 
-function notificar(texto) {
-  execFile('/usr/bin/osascript', ['-e', `display notification ${JSON.stringify(texto)} with title "wacrawl"`], () => {});
+function notify(text) {
+  execFile('/usr/bin/osascript', ['-e', `display notification ${JSON.stringify(text)} with title "wacrawl"`], () => {});
 }
 
 /**
- * ¿Salió algún mensaje MÍO en ese chat desde `desdeMs`? No exige el mismo texto:
- * la persona puede corregir el borrador antes de mandarlo, y eso cuenta igual.
- * OJO: un chat NUEVO (justo el caso de los mensajes en frío) WhatsApp lo crea
- * con ZCONTACTJID = <algo>@lid, y deja el teléfono en ZCONTACTIDENTIFIER. Buscar
- * sólo por ZCONTACTJID no lo encontraba nunca y la cola quedaba esperando.
+ * Did any message FROM ME go out in that chat since `sinceMs`? It doesn't require the same
+ * text: the person may edit the draft before sending it, and that still counts.
+ * CAREFUL: a NEW chat (exactly the case of cold messages) is created by WhatsApp with
+ * ZCONTACTJID = <something>@lid, and the phone number goes in ZCONTACTIDENTIFIER. Looking only
+ * at ZCONTACTJID never found it, and the queue waited forever.
  */
-async function detectarEnvio({ jid, telefono }, desdeMs) {
-  if (process.env.WACRAWL_FAKE_SENT_FILE) {   // sólo para test
-    try { return fs.readFileSync(process.env.WACRAWL_FAKE_SENT_FILE, 'utf8').split('\n').includes(telefono); }
+async function detectSent({ jid, phone }, sinceMs) {
+  if (process.env.WACRAWL_FAKE_SENT_FILE) {   // tests only
+    try { return fs.readFileSync(process.env.WACRAWL_FAKE_SENT_FILE, 'utf8').split('\n').includes(phone); }
     catch { return false; }
   }
-  const jids = [...new Set([jid, `${telefono}@s.whatsapp.net`].filter(Boolean))];
-  const lista = jids.map(sqlString).join(', ');
-  const desde = Math.floor(desdeMs / 1000) - APPLE_EPOCH - 5;
-  const [fila] = await runLiveSQL(
+  const jids = [...new Set([jid, `${phone}@s.whatsapp.net`].filter(Boolean))];
+  const list = jids.map(sqlString).join(', ');
+  const since = Math.floor(sinceMs / 1000) - APPLE_EPOCH - 5;
+  const [row] = await runLiveSQL(
     `SELECT count(*) AS n FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION` +
-    ` WHERE (s.ZCONTACTJID IN (${lista}) OR s.ZCONTACTIDENTIFIER IN (${lista}))` +
-    ` AND m.ZISFROMME = 1 AND m.ZMESSAGEDATE >= ${desde}`
+    ` WHERE (s.ZCONTACTJID IN (${list}) OR s.ZCONTACTIDENTIFIER IN (${list}))` +
+    ` AND m.ZISFROMME = 1 AND m.ZMESSAGEDATE >= ${since}`
   );
-  return (fila?.n ?? 0) > 0;
+  return (row?.n ?? 0) > 0;
 }
 
 /**
- * Cola de borradores. WhatsApp NO conserva el texto de un borrador si se abre
- * otro chat, así que nunca se abren dos seguidos: el siguiente se abre recién
- * cuando se detecta que la persona mandó el actual. El ritmo lo pone ella, no un
- * timer (un timer pisa el borrador si alguien tarda en leer o corregir).
+ * Draft queue. WhatsApp does NOT keep a draft's text if another chat is opened, so two are
+ * never opened in a row: the next one opens only once we detect the person sent the current
+ * one. The person sets the pace, not a timer (a timer overwrites the draft if someone takes a
+ * while to read or edit).
  */
-let cola = null;
-const POLL_MS = Number(process.env.WACRAWL_COLA_POLL_MS) || 2500;
+let draftQueue = null;
+const POLL_MS = Number(process.env.WACRAWL_QUEUE_POLL_MS) || 2500;
 
-function resumenCola() {
-  if (!cola) return 'No hay ninguna cola.';
-  const c = (e) => cola.items.filter((i) => i.estado === e).length;
-  const lineas = cola.items.map((i, n) => {
-    const marca = { enviado: '✓', salteado: '↷', abierto: '▶', pendiente: '·', error: '✗' }[i.estado];
-    return `${marca} ${n + 1}. ${i.nombre}${i.estado === 'error' ? ` — ${i.motivo}` : ''}`;
+function queueSummary() {
+  if (!draftQueue) return 'There is no queue.';
+  const count = (s) => draftQueue.items.filter((i) => i.status === s).length;
+  const lines = draftQueue.items.map((i, n) => {
+    const mark = { sent: '✓', skipped: '↷', open: '▶', pending: '·', error: '✗' }[i.status];
+    return `${mark} ${n + 1}. ${i.name}${i.status === 'error' ? ` — ${i.reason}` : ''}`;
   });
+  const why = draftQueue.status === 'paused' && draftQueue.reason ? ` (${draftQueue.reason})` : '';
   return (
-    `Cola ${cola.estado}: ${c('enviado')} enviados, ${c('salteado')} salteados, ` +
-    `${c('pendiente') + c('abierto')} por mandar.\n\n${lineas.join('\n')}`
+    `Queue ${draftQueue.status}${why}: ${count('sent')} sent, ${count('skipped')} skipped, ` +
+    `${count('pending') + count('open')} to go.\n\n${lines.join('\n')}`
   );
 }
 
-async function abrirSiguiente() {
-  const i = cola.items.findIndex((x) => x.estado === 'pendiente');
+async function openNext() {
+  const i = draftQueue.items.findIndex((x) => x.status === 'pending');
   if (i === -1) {
-    cola.estado = 'terminada';
-    clearInterval(cola.timer);
-    notificar(`Cola terminada: ${cola.items.filter((x) => x.estado === 'enviado').length} de ${cola.items.length} enviados.`);
+    draftQueue.status = 'finished';
+    clearInterval(draftQueue.timer);
+    notify(`Queue finished: ${draftQueue.items.filter((x) => x.status === 'sent').length} of ${draftQueue.items.length} sent.`);
     return;
   }
-  const item = cola.items[i];
-  const bloqueo = chequearBarreras(item.telefono, item.texto, { enCola: true });
-  if (bloqueo) {
-    cola.estado = 'pausada';
-    cola.motivo = bloqueo;
-    notificar(`Cola pausada: ${bloqueo}`);
+  const item = draftQueue.items[i];
+  const blocked = checkSafeguards(item.phone, item.text, { mode: 'queue' });
+  if (blocked) {
+    draftQueue.status = 'paused';
+    draftQueue.reason = blocked;
+    notify(`Queue paused: ${blocked}`);
     return;
   }
   try {
-    await abrirBorrador(item, item.texto, { cola: true });
-    item.estado = 'abierto';
-    item.abiertoEn = Date.now();
+    await openDraft(item, item.text, { queue: true });
+    item.status = 'open';
+    item.openedAt = Date.now();
   } catch (err) {
-    item.estado = 'error';
-    item.motivo = err.message;
-    await abrirSiguiente();
+    item.status = 'error';
+    item.reason = err.message;
+    await openNext();
   }
 }
 
-async function vigilarCola() {
-  if (!cola || cola.estado !== 'activa' || cola.chequeando) return;
-  cola.chequeando = true;
+async function watchQueue() {
+  if (!draftQueue || draftQueue.status !== 'active' || draftQueue.checking) return;
+  draftQueue.checking = true;
   try {
     if (fs.existsSync(KILL_SWITCH)) {
-      cola.estado = 'cancelada';
-      clearInterval(cola.timer);
-      notificar('Cola cancelada: se activó STOP.');
+      draftQueue.status = 'cancelled';
+      clearInterval(draftQueue.timer);
+      notify('Queue cancelled: STOP was turned on.');
       return;
     }
-    const item = cola.items.find((x) => x.estado === 'abierto');
+    const item = draftQueue.items.find((x) => x.status === 'open');
     if (!item) return;
-    if (await detectarEnvio(item, item.abiertoEn)) {
-      item.estado = 'enviado';
-      // pausa breve para que WhatsApp termine de mandar antes de cambiar de chat
+    if (await detectSent(item, item.openedAt)) {
+      item.status = 'sent';
+      // short pause so WhatsApp finishes sending before switching chats
       await sleep(1500);
-      await abrirSiguiente();
-    } else if (Date.now() - item.abiertoEn > cargarLimites().colaEsperaMin * 60000) {
-      cola.estado = 'pausada';
-      cola.motivo = `no se mandó "${item.nombre}" en ${cargarLimites().colaEsperaMin} min`;
-      notificar(`Cola pausada: ${cola.motivo}.`);
+      await openNext();
+    } else if (Date.now() - item.openedAt > loadLimits().queueWaitMin * 60000) {
+      draftQueue.status = 'paused';
+      draftQueue.reason = `"${item.name}" wasn't sent within ${loadLimits().queueWaitMin} min`;
+      notify(`Queue paused: ${draftQueue.reason}.`);
     }
   } catch (err) {
-    // Sin permiso para leer WhatsApp en vivo no se puede detectar el envío:
-    // mejor frenar que seguir abriendo a ciegas.
-    cola.estado = 'pausada';
-    cola.motivo = `no pude chequear si se envió (${err.message.slice(0, 120)})`;
-    notificar('Cola pausada: no puedo detectar envíos.');
+    // Without permission to read WhatsApp live we can't detect the send: better to stop than
+    // to keep opening drafts blind.
+    draftQueue.status = 'paused';
+    draftQueue.reason = `couldn't check whether it was sent (${err.message.slice(0, 120)})`;
+    notify("Queue paused: I can't detect sends.");
   } finally {
-    if (cola) cola.chequeando = false;
+    if (draftQueue) draftQueue.checking = false;
   }
 }
 
 /* ------------------------------------------------------------------ */
-/* transcripciones de audio (Whisper local, ver transcribir.py)        */
+/* voice note transcriptions (local Whisper, see transcribe.py)        */
 /* ------------------------------------------------------------------ */
 
 /**
- * Las transcripciones viven en una base APARTE (~/.wacrawl/transcripciones.sqlite):
- * el archivo de wacrawl nunca se escribe. Las hace transcribir.py, en segundo
- * plano después de cada sync, o en el momento con la tool transcribir_audios.
- * Función y no constante: DRAFTS_DIR se declara más abajo.
+ * Transcriptions live in a SEPARATE database: the wacrawl archive is never written.
+ * transcribe.py fills it, in the background after each sync, or on demand through the
+ * transcribe_audio tool. The file, table and column names (transcripciones, texto…) come
+ * from the original Spanish version and are kept so existing installs keep their data.
  */
-const transcDb = () => path.join(DRAFTS_DIR, 'transcripciones.sqlite');
+const TRANSCRIPTIONS_DB = path.join(DRAFTS_DIR, 'transcripciones.sqlite');
+
+/** Whisper settings: the repo's whisper.env, then the user's ~/.wacrawl/whisper.env (e.g. the language). */
 const WHISPER = (() => {
-  const v = { python: '3.12', paquete: 'mlx-whisper==0.4.3', modelo: 'mlx-community/whisper-large-v3-turbo' };
-  try {   // whisper.env es la fuente de verdad, compartida con los scripts
-    for (const l of fs.readFileSync(path.join(__dirname, 'whisper.env'), 'utf8').split('\n')) {
-      const m = l.match(/^WHISPER_(PYTHON|PAQUETE|MODELO)=(.+)$/);
-      if (m) v[{ PYTHON: 'python', PAQUETE: 'paquete', MODELO: 'modelo' }[m[1]]] = m[2].trim();
-    }
-  } catch { /* defaults */ }
+  const v = { python: '3.12', package: 'mlx-whisper==0.4.3', model: 'mlx-community/whisper-large-v3-turbo', language: '' };
+  const keys = { PYTHON: 'python', PACKAGE: 'package', MODEL: 'model', LANGUAGE: 'language' };
+  for (const file of [path.join(__dirname, 'whisper.env'), path.join(DRAFTS_DIR, 'whisper.env')]) {
+    try {
+      for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+        const m = line.match(/^WHISPER_(PYTHON|PACKAGE|MODEL|LANGUAGE)=(.*)$/);
+        if (!m) continue;
+        const value = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
+        if (value || m[1] === 'LANGUAGE') v[keys[m[1]]] = value;   // only the language may be empty (= detect)
+      }
+    } catch { /* defaults */ }
+  }
   return v;
 })();
 
-async function runTranscSQL(sql) {
-  if (!fs.existsSync(transcDb())) return [];
-  const out = (await runWacrawl(['--db', transcDb(), '--sync', 'never', '--json', 'sql', sql])).trim();
+async function runTranscriptionsSQL(sql) {
+  if (!fs.existsSync(TRANSCRIPTIONS_DB)) return [];
+  const out = (await runWacrawl(['--db', TRANSCRIPTIONS_DB, '--sync', 'never', '--json', 'sql', sql])).trim();
   if (!out) return [];
   const p = JSON.parse(out);
   return (Array.isArray(p) ? p : [p]).filter((r) => r && typeof r === 'object');
 }
 
-/** Pega la transcripción (si existe) a cada fila de audio. "" = no se detectó voz. */
-async function adjuntarTranscripciones(rows) {
+/** Attaches the transcription (if there is one) to each audio row. "" = no speech detected. */
+async function attachTranscriptions(rows) {
   const audios = rows.filter((r) => r.message_type === 'audio' && r.message_id);
   if (!audios.length) return rows;
   const ids = [...new Set(audios.map((r) => r.message_id))];
-  let tr;
+  let found;
   try {
-    tr = await runTranscSQL(`SELECT msg_id, chat_jid, texto FROM transcripciones WHERE msg_id IN (${ids.map(sqlString).join(', ')})`);
+    found = await runTranscriptionsSQL(`SELECT msg_id, chat_jid, texto FROM transcripciones WHERE msg_id IN (${ids.map(sqlString).join(', ')})`);
   } catch {
-    return rows;   // sin transcripciones se muestra "(audio)" como siempre
+    return rows;   // without transcriptions, "(audio)" shows as always
   }
-  const mapa = new Map(tr.map((t) => [`${t.msg_id}|${t.chat_jid}`, t.texto ?? '']));
+  const byKey = new Map(found.map((t) => [`${t.msg_id}|${t.chat_jid}`, t.texto ?? '']));
   for (const r of audios) {
     const k = `${r.message_id}|${r.chat_jid}`;
-    if (mapa.has(k)) r.transcripcion = mapa.get(k);
+    if (byKey.has(k)) r.transcription = byKey.get(k);
   }
   return rows;
 }
 
-/** Busca en lo que se DIJO en los audios. Devuelve null si no hay transcripciones. */
-async function buscarEnAudios({ terms, jid, desde, hasta, de_mi, limite }) {
-  if (!fs.existsSync(transcDb())) return null;
+/** Searches what was SAID in voice notes. Returns null if there are no transcriptions. */
+async function searchVoiceNotes({ terms, jid, since, until, fromMe, limit }) {
+  if (!fs.existsSync(TRANSCRIPTIONS_DB)) return null;
   const w = ["texto <> ''"];
   for (const t of terms) w.push(`lower(texto) LIKE ${sqlString(`%${likeLiteral(t.toLowerCase())}%`)} ESCAPE '\\'`);
-  if (jid) w.push(`chat_jid IN (${(await variantes(jid)).map(sqlString).join(', ')})`);
-  if (desde) w.push(`ts >= ${toEpoch(desde, 'desde')}`);
-  if (hasta) w.push(`ts < ${toEpoch(hasta, 'hasta')}`);
-  if (typeof de_mi === 'boolean') w.push(`from_me = ${de_mi ? 1 : 0}`);
+  if (jid) w.push(`chat_jid IN (${(await jidVariants(jid)).map(sqlString).join(', ')})`);
+  if (since) w.push(`ts >= ${toEpoch(since, 'since')}`);
+  if (until) w.push(`ts < ${toEpoch(until, 'until')}`);
+  if (typeof fromMe === 'boolean') w.push(`from_me = ${fromMe ? 1 : 0}`);
   const clause = w.join(' AND ');
   let total, hits;
   try {
-    const [c] = await runTranscSQL(`SELECT count(*) AS n FROM transcripciones WHERE ${clause}`);
+    const [c] = await runTranscriptionsSQL(`SELECT count(*) AS n FROM transcripciones WHERE ${clause}`);
     total = c?.n ?? 0;
-    hits = total ? await runTranscSQL(`SELECT msg_id, chat_jid, texto FROM transcripciones WHERE ${clause} ORDER BY ts DESC LIMIT ${limite}`) : [];
+    hits = total ? await runTranscriptionsSQL(`SELECT msg_id, chat_jid, texto FROM transcripciones WHERE ${clause} ORDER BY ts DESC LIMIT ${limit}`) : [];
   } catch {
     return null;
   }
   if (!hits.length) return { total, rows: [] };
-  // Los datos para mostrar (quién, dónde, cuándo) salen del archivo, como el resto.
+  // What to display (who, where, when) comes from the archive, like everything else.
   const rows = await selectMessages(
-    'messages m', `m.deleted_at IS NULL AND m.msg_id IN (${hits.map((h) => sqlString(h.msg_id)).join(', ')})`, 'DESC', limite * 2
+    'messages m', `m.deleted_at IS NULL AND m.msg_id IN (${hits.map((h) => sqlString(h.msg_id)).join(', ')})`, 'DESC', limit * 2
   );
-  const mapa = new Map(hits.map((h) => [`${h.msg_id}|${h.chat_jid}`, h.texto]));
-  const conTexto = rows
-    .filter((r) => mapa.has(`${r.message_id}|${r.chat_jid}`))
-    .map((r) => ({ ...r, transcripcion: mapa.get(`${r.message_id}|${r.chat_jid}`) }));
-  return { total, rows: conTexto.slice(0, limite) };
+  const byKey = new Map(hits.map((h) => [`${h.msg_id}|${h.chat_jid}`, h.texto]));
+  const withText = rows
+    .filter((r) => byKey.has(`${r.message_id}|${r.chat_jid}`))
+    .map((r) => ({ ...r, transcription: byKey.get(`${r.message_id}|${r.chat_jid}`) }));
+  return { total, rows: withText.slice(0, limit) };
 }
 
-function seccionAudios(res) {
+function voiceNotesSection(res) {
   if (!res || !res.total) return '';
-  const shown = res.total > res.rows.length ? ` (mostrando ${res.rows.length})` : '';
-  return `\n\nEn audios (transcriptos): ${res.total}${shown}:\n\n${formatMessages(res.rows, { withChat: true })}`;
+  const shown = res.total > res.rows.length ? ` (showing ${res.rows.length})` : '';
+  return `\n\nIn voice notes (transcribed): ${res.total}${shown}:\n\n${formatMessages(res.rows, { withChat: true })}`;
 }
 
-/** uv + modelo bajado + script. Si falta algo, error con la instrucción para arreglarlo. */
-function whisperListo() {
+/** uv + downloaded model + script. If something is missing, an error that says how to fix it. */
+function whisperReady() {
   const uv = [process.env.WACRAWL_UV, path.join(os.homedir(), '.local/bin/uv'), '/opt/homebrew/bin/uv', '/usr/local/bin/uv',
     path.join(os.homedir(), '.cargo/bin/uv')].find((p) => p && fs.existsSync(p));
-  const modelo = path.join(os.homedir(), '.cache/huggingface/hub', `models--${WHISPER.modelo.replace('/', '--')}`);
-  const script = path.join(__dirname, 'transcribir.py');
-  if (!uv || !fs.existsSync(modelo) || !fs.existsSync(script)) {
+  const model = path.join(os.homedir(), '.cache/huggingface/hub', `models--${WHISPER.model.replace('/', '--')}`);
+  const script = path.join(__dirname, 'transcribe.py');
+  if (!uv || !fs.existsSync(model) || !fs.existsSync(script)) {
     throw new Error(
-      'La transcripción de audios no está instalada en esta Mac. Hay que correr una vez ./setup-whisper.sh ' +
-      '(baja el modelo, ~1,6 GB; después todo corre local y sin conexión).'
+      "Voice note transcription isn't installed on this Mac. Run ./setup-whisper.sh once " +
+      '(it downloads the model, ~1.6 GB; after that everything runs locally, offline).'
     );
   }
   return { uv, script };
 }
 
-/** Corre transcribir.py con la lista por stdin; devuelve {clave: texto}. Sin red. */
-function correrTranscriptor({ uv, script }, items) {
+/** Runs transcribe.py with the list on stdin; returns {key: text}. No network. */
+function runTranscriber({ uv, script }, items) {
   return new Promise((resolve, reject) => {
-    const { spawn } = require('node:child_process');
-    const hijo = spawn(uv, ['run', '--quiet', '--python', WHISPER.python, '--with', WHISPER.paquete, 'python', script, '--stdin'], {
+    const child = spawn(uv, ['run', '--quiet', '--python', WHISPER.python, '--with', WHISPER.package, 'python', script, '--stdin'], {
       env: {
         HOME: os.homedir(), PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
-        UV_OFFLINE: '1', HF_HUB_OFFLINE: '1', HF_HUB_DISABLE_TELEMETRY: '1', WACRAWL_DIR: DRAFTS_DIR, WHISPER_MODELO: WHISPER.modelo,
+        UV_OFFLINE: '1', HF_HUB_OFFLINE: '1', HF_HUB_DISABLE_TELEMETRY: '1',
+        WACRAWL_DIR: DRAFTS_DIR, WHISPER_MODEL: WHISPER.model, WHISPER_LANGUAGE: WHISPER.language,
       },
     });
     let out = '', err = '';
-    const reloj = setTimeout(() => { hijo.kill(); reject(new Error('La transcripción tardó demasiado; probá con menos audios.')); }, 170000);
-    hijo.stdout.on('data', (d) => (out += d));
-    hijo.stderr.on('data', (d) => (err += d));
-    hijo.on('error', (e) => { clearTimeout(reloj); reject(e); });
-    hijo.on('close', (code) => {
-      clearTimeout(reloj);
+    const timer = setTimeout(() => { child.kill(); reject(new Error('Transcription took too long; try fewer voice notes.')); }, 170000);
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (err += d));
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
       const res = {};
       for (const l of out.split('\n').filter(Boolean)) {
-        try { const j = JSON.parse(l); res[`${j.msg_id}|${j.chat_jid}`] = j.texto; } catch { /* línea ajena */ }
+        try { const j = JSON.parse(l); res[`${j.msg_id}|${j.chat_jid}`] = j.text; } catch { /* not ours */ }
       }
       if (code !== 0 && !Object.keys(res).length) {
-        reject(new Error(`No pude transcribir: ${err.split('\n').filter((x) => x && !/Warning/.test(x)).slice(-2).join(' ').slice(0, 200)}`));
+        reject(new Error(`Couldn't transcribe: ${err.split('\n').filter((x) => x && !/Warning/.test(x)).slice(-2).join(' ').slice(0, 200)}`));
       } else resolve(res);
     });
-    hijo.stdin.end(JSON.stringify(items));
+    child.stdin.end(JSON.stringify(items));
   });
 }
 
 /* ------------------------------------------------------------------ */
-/* adjuntos: archivo histórico + WhatsApp en vivo                      */
+/* attachments: the archive + WhatsApp live                            */
 /* ------------------------------------------------------------------ */
 
 /**
- * El archivo histórico se actualiza cada 6 h: un documento que llegó hace un
- * rato existe en la Mac (WhatsApp lo descarga solo) pero todavía no está ahí.
- * Antes, ver/exportar sólo miraban el archivo, así que pedir "el docx que me
- * mandaron recién" devolvía el último que sí estaba — otro archivo, más viejo.
- * Ahora se buscan los dos lados y se unen por id de mensaje.
+ * The archive is updated every 6 h: a document that arrived a while ago exists on the Mac
+ * (WhatsApp downloads it on its own) but isn't in the archive yet. View/export used to look
+ * only at the archive, so asking for "the docx they just sent me" returned the newest one
+ * that WAS there — a different, older file. Now both sides are searched and joined by
+ * message id.
  *
- * En la base viva: ZMESSAGETYPE 1 imagen, 2 video, 3 audio, 8 documento,
- * 11 gif, 15 sticker (7 son miniaturas de links: se ignoran). Para documentos,
- * ZTEXT es el NOMBRE ORIGINAL del archivo y ZTITLE el texto que lo acompaña.
- * ZMEDIALOCALPATH es relativo a <container>/Message/.
+ * In the live database: ZMESSAGETYPE 1 image, 2 video, 3 audio, 8 document, 11 gif,
+ * 15 sticker (7 are link thumbnails: ignored). For documents, ZTEXT is the file's ORIGINAL
+ * NAME and ZTITLE the text that came with it. ZMEDIALOCALPATH is relative to <container>/Message/.
  */
-const TIPO_VIVO = { 1: 'image', 2: 'video', 3: 'audio', 8: 'document', 11: 'gif', 15: 'sticker' };
-const CODIGO_VIVO = Object.fromEntries(Object.entries(TIPO_VIVO).map(([k, v]) => [v, Number(k)]));
+const LIVE_TYPES = { 1: 'image', 2: 'video', 3: 'audio', 8: 'document', 11: 'gif', 15: 'sticker' };
+const LIVE_CODES = Object.fromEntries(Object.entries(LIVE_TYPES).map(([k, v]) => [v, Number(k)]));
 
-async function adjuntosEnVivo({ jid, chatTexto, tipos, contiene, desde, hasta, limite }) {
+async function liveAttachments({ jid, chatText, types, contains, since, until, limit }) {
   const container = path.dirname(await sourcePath());
-  // Sin filtrar por ZMEDIALOCALPATH: un adjunto que WhatsApp no descargó (los grandes no se bajan
-  // solos) tiene que aparecer como tal. Si se descarta en silencio, el modelo inventa un motivo.
+  // No filter on ZMEDIALOCALPATH: an attachment WhatsApp didn't download (large ones don't
+  // download on their own) has to show up as such. Dropped silently, the model makes up a reason.
   const w = [];
-  const codigos = tipos.map((t) => CODIGO_VIVO[t]).filter(Boolean);
-  w.push(`m.ZMESSAGETYPE IN (${codigos.join(', ')})`);
+  const codes = types.map((t) => LIVE_CODES[t]).filter(Boolean);
+  w.push(`m.ZMESSAGETYPE IN (${codes.join(', ')})`);
   if (jid) {
-    const lista = (await variantes(jid)).map(sqlString).join(', ');
-    w.push(`(s.ZCONTACTJID IN (${lista}) OR s.ZCONTACTIDENTIFIER IN (${lista}))`);
+    const list = (await jidVariants(jid)).map(sqlString).join(', ');
+    w.push(`(s.ZCONTACTJID IN (${list}) OR s.ZCONTACTIDENTIFIER IN (${list}))`);
   }
-  else if (chatTexto) w.push(`lower(s.ZPARTNERNAME) LIKE ${sqlString(`%${likeLiteral(chatTexto.toLowerCase())}%`)} ESCAPE '\\'`);
-  if (contiene) {
-    w.push(`lower(coalesce(m.ZTEXT, '') || ' ' || coalesce(mi.ZTITLE, '')) LIKE ${sqlString(`%${likeLiteral(String(contiene).toLowerCase())}%`)} ESCAPE '\\'`);
+  else if (chatText) w.push(`lower(s.ZPARTNERNAME) LIKE ${sqlString(`%${likeLiteral(chatText.toLowerCase())}%`)} ESCAPE '\\'`);
+  if (contains) {
+    w.push(`lower(coalesce(m.ZTEXT, '') || ' ' || coalesce(mi.ZTITLE, '')) LIKE ${sqlString(`%${likeLiteral(String(contains).toLowerCase())}%`)} ESCAPE '\\'`);
   }
-  if (desde) w.push(`m.ZMESSAGEDATE >= ${toEpoch(desde, 'desde') - APPLE_EPOCH}`);
-  if (hasta) w.push(`m.ZMESSAGEDATE < ${toEpoch(hasta, 'hasta') - APPLE_EPOCH}`);
-  const filas = await runLiveSQL(
+  if (since) w.push(`m.ZMESSAGEDATE >= ${toEpoch(since, 'since') - APPLE_EPOCH}`);
+  if (until) w.push(`m.ZMESSAGEDATE < ${toEpoch(until, 'until') - APPLE_EPOCH}`);
+  const rows = await runLiveSQL(
     `SELECT m.ZSTANZAID AS message_id, CAST(m.ZMESSAGEDATE + ${APPLE_EPOCH} AS INTEGER) AS ts,` +
     ` strftime('%Y-%m-%d %H:%M', m.ZMESSAGEDATE + ${APPLE_EPOCH}, 'unixepoch', 'localtime') AS timestamp,` +
-    ` m.ZISFROMME AS from_me, m.ZMESSAGETYPE AS codigo, m.ZTEXT AS text, mi.ZTITLE AS media_title,` +
-    ` mi.ZMEDIALOCALPATH AS ruta_rel, s.ZPARTNERNAME AS chat_name, s.ZCONTACTJID AS chat_jid,` +
+    ` m.ZISFROMME AS from_me, m.ZMESSAGETYPE AS code, m.ZTEXT AS text, mi.ZTITLE AS media_title,` +
+    ` mi.ZMEDIALOCALPATH AS rel_path, s.ZPARTNERNAME AS chat_name, s.ZCONTACTJID AS chat_jid,` +
     ` gm.ZCONTACTNAME AS member_name, gm.ZMEMBERJID AS member_jid, mi.ZFILESIZE AS bytes` +
     ` FROM ZWAMESSAGE m JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM` +
     ` JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER` +
-    ` WHERE ${w.join(' AND ')} ORDER BY m.ZMESSAGEDATE DESC LIMIT ${limite}`
+    ` WHERE ${w.join(' AND ')} ORDER BY m.ZMESSAGEDATE DESC LIMIT ${limit}`
   );
-  return filas.map((f) => ({
+  return rows.map((f) => ({
     message_id: f.message_id, ts: f.ts, timestamp: f.timestamp, from_me: f.from_me,
-    message_type: TIPO_VIVO[f.codigo], text: f.text, media_title: f.media_title,
-    media_path: f.ruta_rel ? path.join(container, 'Message', f.ruta_rel) : null,
-    descargado: Boolean(f.ruta_rel), bytes: f.bytes,
+    message_type: LIVE_TYPES[f.code], text: f.text, media_title: f.media_title,
+    media_path: f.rel_path ? path.join(container, 'Message', f.rel_path) : null,
+    downloaded: Boolean(f.rel_path), bytes: f.bytes,
     chat_name: f.chat_name, chat_jid: f.chat_jid,
-    // senderLabel: en un grupo, el miembro; en un DM, la contraparte del chat
+    // senderLabel: in a group, the member; in a one-to-one chat, the other party
     sender_name: f.member_name || null, sender_jid: f.member_jid || f.chat_jid,
   }));
 }
 
-/** Adjuntos del archivo histórico Y de WhatsApp en vivo, unidos, del más nuevo al más viejo. */
-async function buscarAdjuntos({ chat, tipos, contiene, desde, hasta, limite }) {
+/** Attachments from the archive AND from WhatsApp live, joined, newest first. */
+async function findAttachments({ chat, types, contains, since, until, limit }) {
   let jid = null;
-  let chatTexto = null;
+  let chatText = null;
   if (chat) {
     try {
       jid = await resolveChatJID(chat);
     } catch (err) {
-      // Un chat nuevo puede no estar todavía en el archivo: se busca por nombre en vivo.
-      if (!/No encontré/.test(err.message)) throw err;
-      chatTexto = String(chat).trim();
+      // A brand-new chat may not be in the archive yet: look it up by name, live.
+      if (err.code !== 'CHAT_NOT_FOUND') throw err;
+      chatText = String(chat).trim();
     }
   }
 
-  let archivo = [];
-  if (!chatTexto) {
-    const where = await commonFilters({ chat: jid, desde, hasta });
+  let archived = [];
+  if (!chatText) {
+    const where = await commonFilters({ chat: jid, since, until });
     where.push(`m.media_path IS NOT NULL AND m.media_path <> ''`);
-    where.push(`m.message_type IN (${tipos.map(sqlString).join(', ')})`);
-    if (contiene) {
-      const c = sqlString(`%${likeLiteral(String(contiene).toLowerCase())}%`);
+    where.push(`m.message_type IN (${types.map(sqlString).join(', ')})`);
+    if (contains) {
+      const c = sqlString(`%${likeLiteral(String(contains).toLowerCase())}%`);
       where.push(`(lower(coalesce(m.text, '')) LIKE ${c} ESCAPE '\\' OR lower(coalesce(m.media_title, '')) LIKE ${c} ESCAPE '\\')`);
     }
-    archivo = await selectMessages('messages m', where.join(' AND '), 'DESC', limite);
+    archived = await selectMessages('messages m', where.join(' AND '), 'DESC', limit);
   }
 
-  let vivo = [];
-  let avisoVivo = null;
+  let live = [];
+  let liveWarning = null;
   try {
-    vivo = await adjuntosEnVivo({ jid, chatTexto, tipos, contiene, desde, hasta, limite });
+    live = await liveAttachments({ jid, chatText, types, contains, since, until, limit });
   } catch (err) {
-    avisoVivo = `No pude mirar WhatsApp en vivo (${err.message.slice(0, 100)}): puede faltar lo que llegó en las últimas horas.`;
+    liveWarning = `Couldn't look at WhatsApp live (${err.message.slice(0, 100)}): anything that arrived in the last few hours may be missing.`;
   }
 
-  // Si el archivo tiene su copia en disco, se usa esa (no depende de permisos de macOS).
-  const porId = new Map(vivo.map((r) => [r.message_id, r]));
-  for (const r of archivo) {
-    if (r.media_path && fs.existsSync(r.media_path)) porId.set(r.message_id, r);
-    else if (!porId.has(r.message_id)) porId.set(r.message_id, r);
+  // If the archive has its own copy on disk, use that one (it doesn't depend on macOS permissions).
+  const byId = new Map(live.map((r) => [r.message_id, r]));
+  for (const r of archived) {
+    if (r.media_path && fs.existsSync(r.media_path)) byId.set(r.message_id, r);
+    else if (!byId.has(r.message_id)) byId.set(r.message_id, r);
   }
-  const filas = [...porId.values()].sort((a, b) => (b.ts || 0) - (a.ts || 0));
-  return { filas, avisoVivo, chatNoEncontrado: chatTexto && !filas.length ? chatTexto : null };
+  const rows = [...byId.values()].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return { rows, liveWarning, chatNotFound: chatText && !rows.length ? chatText : null };
 }
 
-const tamano = (b) => !b ? '' : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1e3))} KB`;
+const formatSize = (b) => !b ? '' : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1e3))} KB`;
 
-/** Aviso para un adjunto que existe en el chat pero WhatsApp Desktop no descargó. */
-function avisoNoDescargado(m) {
-  const nombre = nombreOriginal(m) || m.text || TIPOS[m.message_type] || 'archivo';
-  const peso = m.bytes ? `, ${tamano(m.bytes)}` : '';
-  return `${m.timestamp} [${m.chat_name}] «${nombre}»${peso}: WhatsApp Desktop NO lo descargó` +
-    `${m.bytes > 1e8 ? ' (los archivos grandes no se bajan solos)' : ''}. No es un problema de atraso ni de sync:` +
-    ` hay que abrir ese chat en WhatsApp Desktop y tocar el archivo para descargarlo; apenas termine, ya se puede leer/exportar.`;
+/** Note for an attachment that exists in the chat but WhatsApp Desktop never downloaded. */
+function notDownloadedNote(m) {
+  const name = originalName(m) || m.text || TYPE_LABELS[m.message_type] || 'file';
+  const size = m.bytes ? `, ${formatSize(m.bytes)}` : '';
+  return `${m.timestamp} [${m.chat_name}] «${name}»${size}: WhatsApp Desktop did NOT download it` +
+    `${m.bytes > 1e8 ? " (large files don't download on their own)" : ''}. It isn't a lag or sync problem:` +
+    ' open that chat in WhatsApp Desktop and click the file to download it; as soon as it finishes, it can be read/exported.';
 }
 
-/** Nombre original de un documento (WhatsApp lo guarda), o null si no es un nombre de archivo. */
-function nombreOriginal(m) {
-  // En documentos, ese campo es el título del archivo (el texto que lo acompaña va en media_title).
-  // A veces WhatsApp lo guarda SIN extensión ("Informe trimestral - final"): se le agrega la real.
+/** The original name of a document (WhatsApp stores it), or null if it isn't a file name. */
+function originalName(m) {
+  // For documents, that field is the file's title (the text that came with it goes in media_title).
+  // Sometimes WhatsApp stores it WITHOUT an extension ("Quarterly report - final"): we add the real one.
   const t = String(m.text || '').trim();
   if (m.message_type !== 'document' || !t || looksLikeBlob(t) || t.length > 150 || /\n/.test(t)) return null;
   if (/\.[A-Za-z0-9]{2,5}$/.test(t)) return t;
-  const ext = m.media_path && fs.existsSync(m.media_path) ? extensionDe(m.media_path) : '';
+  const ext = m.media_path && fs.existsSync(m.media_path) ? detectExtension(m.media_path) : '';
   return ext ? `${t}${ext}` : t;
 }
 
@@ -854,22 +889,22 @@ function nombreOriginal(m) {
 /* SQL helpers                                                         */
 /* ------------------------------------------------------------------ */
 
-/** Literal SQL entrecomillado. Duplica las comillas simples. */
+/** A quoted SQL literal. Doubles single quotes. */
 const sqlString = (value) => `'${String(value).replace(/'/g, "''")}'`;
 
-/** Escapa los comodines de LIKE para que la búsqueda sea literal (ESCAPE '\'). */
+/** Escapes LIKE wildcards so the search is literal (ESCAPE '\'). */
 const likeLiteral = (value) => String(value).replace(/([\\%_])/g, '\\$1');
 
-/** Query FTS5 como frase literal: entre comillas dobles, duplicando las internas. */
+/** An FTS5 query as a literal phrase: in double quotes, doubling the inner ones. */
 const ftsPhrase = (value) => `"${String(value).replace(/"/g, '""')}"`;
 
-/** Convierte YYYY-MM-DD o RFC3339 a epoch en segundos. */
+/** Converts YYYY-MM-DD or RFC3339 to epoch seconds. */
 function toEpoch(value, label) {
   const raw = String(value).trim();
   const iso = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T00:00:00Z` : raw;
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) {
-    throw new Error(`\`${label}\` no es una fecha válida: "${value}". Usá YYYY-MM-DD o RFC3339.`);
+    throw new Error(`\`${label}\` is not a valid date: "${value}". Use YYYY-MM-DD or RFC3339.`);
   }
   return Math.floor(ms / 1000);
 }
@@ -880,283 +915,281 @@ function clampLimit(limit, fallback, max) {
 }
 
 /**
- * El archivo guarda la misma conversación más de una vez (mismo msg_id con
- * distinto source_pk), así que agrupamos siempre — y antes del LIMIT, o los
- * conteos salen ~3x inflados y el limit devuelve de menos.
+ * The archive stores the same conversation more than once (same msg_id with a different
+ * source_pk), so we always group — and before the LIMIT, or counts come out ~3x inflated and
+ * the limit returns too few.
  */
 const GROUPING = 'GROUP BY m.msg_id, m.chat_jid, m.ts, m.text';
 
 const MSG_COLUMNS =
   `m.msg_id AS message_id, m.chat_jid, m.chat_name, m.sender_name, m.sender_jid,` +
   ` m.from_me, m.text, m.message_type, m.media_title, m.media_path, m.ts,` +
-  // Hora LOCAL de esta Mac. En UTC los mensajes de la noche caen al día
-  // siguiente y todo se lee corrido.
+  // This Mac's LOCAL time. In UTC, night-time messages fall on the next day and everything
+  // reads shifted.
   ` strftime('%Y-%m-%d %H:%M', m.ts, 'unixepoch', 'localtime') AS timestamp`;
 
 async function countDistinct(from, clause) {
-  const partes = await Promise.all(enAmbos((tramo) =>
-    `SELECT count(*) AS n FROM (SELECT 1 FROM ${from} WHERE (${clause})${tramo} ${GROUPING})`));
-  return partes.reduce((total, [row]) => total + (row?.n ?? 0), 0);
+  const parts = await Promise.all(inBoth((range) =>
+    `SELECT count(*) AS n FROM (SELECT 1 FROM ${from} WHERE (${clause})${range} ${GROUPING})`));
+  return parts.reduce((total, [row]) => total + (row?.n ?? 0), 0);
 }
 
 async function selectMessages(from, clause, order, limit) {
-  const partes = await Promise.all(enAmbos((tramo) =>
-    `SELECT ${MSG_COLUMNS} FROM ${from} WHERE (${clause})${tramo} ${GROUPING} ORDER BY m.ts ${order} LIMIT ${limit}`));
-  if (partes.length === 1) return partes[0];
-  const filas = partes.flat().sort((a, b) => (order === 'ASC' ? a.ts - b.ts : b.ts - a.ts));
-  return filas.slice(0, limit);
+  const parts = await Promise.all(inBoth((range) =>
+    `SELECT ${MSG_COLUMNS} FROM ${from} WHERE (${clause})${range} ${GROUPING} ORDER BY m.ts ${order} LIMIT ${limit}`));
+  if (parts.length === 1) return parts[0];
+  const rows = parts.flat().sort((a, b) => (order === 'ASC' ? a.ts - b.ts : b.ts - a.ts));
+  return rows.slice(0, limit);
 }
 
 /* ------------------------------------------------------------------ */
-/* dominio                                                             */
+/* domain                                                              */
 /* ------------------------------------------------------------------ */
 
-// Ojo con `chats.last_message_at`: hay filas con fechas corruptas (año 9026)
-// que encabezarían cualquier orden por fecha. Usamos max(m.ts) de los mensajes
-// reales, que no puede mentir.
-const chatsSQL = (tramo) =>
+// Careful with `chats.last_message_at`: some rows have corrupt dates (year 9026) that would top
+// any date sort. We use max(m.ts) of the real messages, which can't lie.
+const chatsSQL = (range) =>
   `SELECT c.jid, c.kind, c.name, c.unread_count,` +
   ` count(m.rowid) AS message_count,` +
   ` max(m.ts) AS last_ts` +
-  ` FROM chats c LEFT JOIN messages m ON m.chat_jid = c.jid AND m.deleted_at IS NULL${tramo}` +
+  ` FROM chats c LEFT JOIN messages m ON m.chat_jid = c.jid AND m.deleted_at IS NULL${range}` +
   ` WHERE c.deleted_at IS NULL`;
 
 const ORDERS = {
-  recientes: (a, b) => (b.last_ts || 0) - (a.last_ts || 0),
-  mensajes: (a, b) => b.message_count - a.message_count,
+  recent: (a, b) => (b.last_ts || 0) - (a.last_ts || 0),
+  messages: (a, b) => b.message_count - a.message_count,
 };
 
 /**
- * La misma persona puede tener dos JID: WhatsApp pasó muchos contactos al "@lid" nuevo (Desktop
- * ya los guarda así) y el iPhone o los chats viejos los tienen con el número. Sin unirlos, un chat
- * sale dos veces y buscarlo por nombre da "ambiguo". `contacts.lid` de cada archivo da el par.
+ * The same person can have two JIDs: WhatsApp moved many contacts to the new "@lid" (Desktop
+ * already stores them that way) while the iPhone or older chats have them by number. Without
+ * joining them, a chat shows up twice and looking it up by name comes back "ambiguous". Each
+ * archive's `contacts.lid` gives the pair.
  */
 let aliasCache = null;
 
-async function aliasesLid() {
-  if (aliasCache && Date.now() - aliasCache.t < 10 * 60 * 1000) return aliasCache.mapa;
+async function lidAliases() {
+  if (aliasCache && Date.now() - aliasCache.t < 10 * 60 * 1000) return aliasCache.map;
   const sql = `SELECT jid, lid FROM contacts WHERE lid LIKE '%@lid' AND jid LIKE '%@s.whatsapp.net'`;
-  const h = historico();
-  const filas = (await Promise.all([runSQL(sql), h ? runSQL(sql, h.db) : []])).flat();
-  const mapa = new Map();
-  for (const { jid, lid } of filas) { mapa.set(lid, jid); mapa.set(jid, lid); }
-  aliasCache = { t: Date.now(), mapa };
-  return mapa;
+  const h = historyArchive();
+  const rows = (await Promise.all([runSQL(sql), h ? runSQL(sql, h.db) : []])).flat();
+  const map = new Map();
+  for (const { jid, lid } of rows) { map.set(lid, jid); map.set(jid, lid); }
+  aliasCache = { t: Date.now(), map };
+  return map;
 }
 
-/** Los JID con que puede aparecer un chat: el dado y, si lo hay, su par @lid ⇄ número. */
-async function variantes(jid) {
-  const par = (await aliasesLid()).get(jid);
-  return par ? [jid, par] : [jid];
+/** The JIDs a chat can appear under: the given one and, if there is one, its @lid ⇄ number pair. */
+async function jidVariants(jid) {
+  const pair = (await lidAliases()).get(jid);
+  return pair ? [jid, pair] : [jid];
 }
 
 /**
- * Los conteos por chat del histórico se calculan UNA vez y quedan en historico/chats.json: es una
- * foto fija y la consulta tarda ~15 s, lo mismo que la del principal. Repetirla duplicaba lo que
- * tarda listar_chats, y precalentarla al arrancar trababa la primera consulta de cada sesión.
+ * Per-chat counts for the history archive are computed ONCE and kept in historico/chats.json:
+ * it's a frozen snapshot and the query takes ~15 s, as long as the main one. Repeating it
+ * doubled how long list_chats took, and warming it up at startup blocked each session's first
+ * query. (The file's `corte` key is the on-disk name of the cutoff.)
  */
-let chatsHistorico = null;
+let historyChatsCache = null;
 
-function chatsDelHistorico(h) {
-  if (chatsHistorico?.corte === h.corte) return chatsHistorico.promesa;
-  const archivo = path.join(HISTORICO_DIR, 'chats.json');
-  let promesa;
+function historyChats(h) {
+  if (historyChatsCache?.cutoff === h.cutoff) return historyChatsCache.promise;
+  const file = path.join(HISTORY_DIR, 'chats.json');
+  let promise;
   try {
-    const guardado = JSON.parse(fs.readFileSync(archivo, 'utf8'));
-    if (guardado.corte !== h.corte) throw new Error('es de otra importación');
-    promesa = Promise.resolve(guardado.chats);
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (saved.corte !== h.cutoff) throw new Error('it is from another import');
+    promise = Promise.resolve(saved.chats);
   } catch {
-    promesa = runSQL(`${chatsSQL(` AND m.ts < ${h.corte}`)} GROUP BY c.jid`, h.db).then((chats) => {
-      try { fs.writeFileSync(archivo, JSON.stringify({ corte: h.corte, chats })); } catch {}
+    promise = runSQL(`${chatsSQL(` AND m.ts < ${h.cutoff}`)} GROUP BY c.jid`, h.db).then((chats) => {
+      try { fs.writeFileSync(file, JSON.stringify({ corte: h.cutoff, chats })); } catch {}
       return chats;
     });
-    promesa.catch(() => { chatsHistorico = null; });
+    promise.catch(() => { historyChatsCache = null; });
   }
-  chatsHistorico = { corte: h.corte, promesa };
-  return promesa;
+  historyChatsCache = { cutoff: h.cutoff, promise };
+  return promise;
 }
 
-/** Chats de los dos archivos unidos por persona. `nombre` (en minúsculas) filtra por subcadena. */
-async function queryChats(nombre = null) {
-  const h = historico();
-  const filtro = nombre ? ` AND lower(c.name) LIKE ${sqlString(`%${likeLiteral(nombre)}%`)} ESCAPE '\\'` : '';
-  const [principal, viejos, alias] = await Promise.all([
-    runSQL(`${chatsSQL(h ? ` AND m.ts >= ${h.corte}` : '')}${filtro} GROUP BY c.jid`),
-    h ? chatsDelHistorico(h) : [],
-    aliasesLid(),
+/** Chats from both archives, joined per person. `nameFilter` (lowercase) filters by substring. */
+async function queryChats(nameFilter = null) {
+  const h = historyArchive();
+  const filter = nameFilter ? ` AND lower(c.name) LIKE ${sqlString(`%${likeLiteral(nameFilter)}%`)} ESCAPE '\\'` : '';
+  const [main, old, aliases] = await Promise.all([
+    runSQL(`${chatsSQL(h ? ` AND m.ts >= ${h.cutoff}` : '')}${filter} GROUP BY c.jid`),
+    h ? historyChats(h) : [],
+    lidAliases(),
   ]);
-  const partes = [principal, nombre ? viejos.filter((c) => (c.name || '').toLowerCase().includes(nombre)) : viejos];
-  const clave = (jid) => (jid.endsWith('@lid') && alias.get(jid)) || jid;
-  const porJid = new Map();
-  partes.forEach((filas, i) => {
-    for (const c of filas) {
-      const previo = porJid.get(clave(c.jid));
-      // Los no leídos del histórico son de la foto del iPhone, no de hoy.
-      if (!previo) { porJid.set(clave(c.jid), i === 0 ? { ...c } : { ...c, unread_count: 0 }); continue; }
-      previo.unread_count += i === 0 ? c.unread_count : 0;
-      previo.message_count += c.message_count;
-      previo.last_ts = Math.max(previo.last_ts || 0, c.last_ts || 0) || null;
-      previo.name ||= c.name;   // el principal va primero y tiene el nombre actual
+  const parts = [main, nameFilter ? old.filter((c) => (c.name || '').toLowerCase().includes(nameFilter)) : old];
+  const keyOf = (jid) => (jid.endsWith('@lid') && aliases.get(jid)) || jid;
+  const byJid = new Map();
+  parts.forEach((rows, i) => {
+    for (const c of rows) {
+      const prev = byJid.get(keyOf(c.jid));
+      // Unread counts from the history archive are from the iPhone snapshot, not from today.
+      if (!prev) { byJid.set(keyOf(c.jid), i === 0 ? { ...c } : { ...c, unread_count: 0 }); continue; }
+      prev.unread_count += i === 0 ? c.unread_count : 0;
+      prev.message_count += c.message_count;
+      prev.last_ts = Math.max(prev.last_ts || 0, c.last_ts || 0) || null;
+      prev.name ||= c.name;   // the main archive comes first and has the current name
     }
   });
-  return [...porJid.values()].map((c) => ({
+  return [...byJid.values()].map((c) => ({
     ...c,
     last_message_at: c.last_ts ? new Date(c.last_ts * 1000).toISOString().replace(/\.\d+Z$/, 'Z') : null,
   }));
 }
 
-const listChats = async (orden = 'recientes') =>
-  (await queryChats()).sort(ORDERS[orden] || ORDERS.recientes);
+const listChats = async (order = 'recent') =>
+  (await queryChats()).sort(ORDERS[order] || ORDERS.recent);
 
-/** Resuelve un nombre de chat a su JID. Si ya es un JID, lo devuelve tal cual. */
+/** Resolves a chat name to its JID. If it already is a JID, returns it as is. */
 async function resolveChatJID(chat) {
   const value = String(chat).trim();
   if (value.includes('@')) return value;
 
   const needle = value.toLowerCase();
-  const rows = (await queryChats(needle)).sort(ORDERS.mensajes);
+  const rows = (await queryChats(needle)).sort(ORDERS.messages);
 
   if (rows.length === 0) {
-    throw new Error(
-      `No encontré ningún chat que coincida con "${value}". Puede estar agendado con un apodo o sólo con el nombre: ` +
-      `probá con una parte (el apellido, el nombre de pila), usá listar_chats con un filtro, o preguntale al usuario cómo lo tiene agendado. ` +
-      `No adivines cuál es: si hay dudas, preguntá.`
-    );
+    throw Object.assign(new Error(
+      `No chat matches "${value}". They may be saved under a nickname or just a first name: ` +
+      'try part of it (last name, first name), use list_chats with a filter, or ask the user how they have them saved. ' +
+      "Don't guess which one it is: if in doubt, ask."
+    ), { code: 'CHAT_NOT_FOUND' });
   }
 
-  // Los chats de estados (las historias, *@*.status) tienen el mismo nombre que la persona pero no son
-  // una conversación: si hay otro candidato, no cuentan. Sin esto "Juan Pérez" era "ambiguo".
-  const conversaciones = rows.filter((c) => c.kind !== 'status' && !String(c.jid).endsWith('.status'));
-  const pool = conversaciones.length ? conversaciones : rows;
+  // Status chats (stories, *@*.status) have the same name as the person but aren't a
+  // conversation: if there's another candidate, they don't count. Without this, looking up a
+  // contact by name matched both their chat and their status feed, and came back "ambiguous".
+  const conversations = rows.filter((c) => c.kind !== 'status' && !String(c.jid).endsWith('.status'));
+  const pool = conversations.length ? conversations : rows;
   const exact = pool.filter((c) => (c.name || '').toLowerCase() === needle);
   const candidates = exact.length ? exact : pool;
   if (candidates.length === 1) return candidates[0].jid;
 
-  const top = candidates.slice(0, 10).map((c) => `  • ${c.name} — ${c.jid} (${c.message_count} mensajes)`);
+  const top = candidates.slice(0, 10).map((c) => `  • ${c.name} — ${c.jid} (${c.message_count} messages)`);
   throw new Error(
-    `"${value}" coincide con ${candidates.length} chats. Volvé a llamar con el JID exacto:\n${top.join('\n')}` +
-    (candidates.length > 10 ? `\n  … y ${candidates.length - 10} más` : '')
+    `"${value}" matches ${candidates.length} chats. Call again with the exact JID:\n${top.join('\n')}` +
+    (candidates.length > 10 ? `\n  … and ${candidates.length - 10} more` : '')
   );
 }
 
 /**
- * En ~21% de los mensajes recibidos en grupos el remitente no quedó resuelto:
- * `sender_jid` es el JID del grupo y `sender_name` un blob base64 tipo "IAA=".
- * No hay de dónde recuperar la identidad (contacts.lid no matchea), así que lo
- * decimos explícitamente en vez de mostrar el blob como si fuera un nombre.
+ * In ~21% of messages received in groups the sender wasn't resolved: `sender_jid` is the
+ * group's JID and `sender_name` a base64 blob like "IAA=". There's nowhere to recover the
+ * identity from (contacts.lid doesn't match), so we say so explicitly instead of showing the
+ * blob as if it were a name.
  */
-// Dos formas en que se filtran identificadores internos como si fueran texto:
-// base64 con "=" de padding (nombres de remitente, hashes de media) y hex largo
-// en mayúsculas (las reacciones). Ningún mensaje real se ve así.
+// Two ways internal identifiers leak through as if they were text: base64 with "=" padding
+// (sender names, media hashes) and long uppercase hex (reactions). No real message looks like that.
 const looksLikeBlob = (value) => {
   const v = String(value).trim();
   return /^[A-Za-z0-9+/]{2,}={1,2}$/.test(v) || /^[0-9A-F]{16,}$/.test(v);
 };
 
 function senderLabel(m) {
-  if (m.from_me) return 'Yo';
+  if (m.from_me) return 'Me';
   const name = m.sender_name;
   if (name && !looksLikeBlob(name)) return name;
 
-  // En un DM el remitente es, por definición, la contraparte del chat: aunque
-  // el nombre venga como blob, sabemos perfectamente quién es. Lo mismo vale
-  // para un estado: lo publicó el dueño del chat.
-  if (esEstado(m)) return m.chat_name || 'alguien';
+  // In a one-to-one chat the sender is, by definition, the other party: even if the name comes
+  // as a blob, we know exactly who it is. The same goes for a status: the chat's owner posted it.
+  if (isStatus(m)) return m.chat_name || 'someone';
   if (m.sender_jid && m.sender_jid === m.chat_jid) return m.chat_name || m.sender_jid;
 
-  // En grupos sólo queda el @lid opaco. Lo mostramos igual porque es estable
-  // por persona: permite ver que dos mensajes son del mismo desconocido.
-  return m.sender_jid ? `(no identificado · ${m.sender_jid})` : '(remitente no identificado)';
+  // In groups only the opaque @lid is left. We show it anyway because it's stable per person:
+  // it lets you see that two messages came from the same unknown person.
+  return m.sender_jid ? `(unidentified · ${m.sender_jid})` : '(unidentified sender)';
 }
 
-/** Etiqueta legible por tipo, para lo que no es texto. */
-const TIPOS = {
-  audio: 'audio', sticker: 'sticker', image: 'imagen', video: 'video',
-  document: 'documento', location: 'ubicación', contact: 'contacto',
-  reaction: 'reacción', system: 'mensaje de sistema', group_event: 'evento de grupo',
+/** A readable label per type, for whatever isn't text. */
+const TYPE_LABELS = {
+  audio: 'audio', sticker: 'sticker', image: 'image', video: 'video',
+  document: 'document', location: 'location', contact: 'contact',
+  reaction: 'reaction', system: 'system message', group_event: 'group event',
 };
 
 /**
- * OJO: en audios, stickers e imágenes wacrawl mete el HASH del archivo en el
- * campo `text`. Mostrarlo tal cual hacía que un audio y un sticker se vieran
- * exactamente igual — un blob base64 indistinguible. Si el texto es un blob,
- * mandamos el tipo.
+ * CAREFUL: for audio, stickers and images wacrawl puts the file's HASH in the `text` field.
+ * Showing it as is made a voice note and a sticker look exactly the same — an
+ * indistinguishable base64 blob. If the text is a blob, we show the type instead.
  */
 function messageBody(m) {
-  if (m.message_type === 'audio' && m.transcripcion !== undefined) {
-    return m.transcripcion ? `(audio) «${m.transcripcion}»` : '(audio sin voz detectable)';
+  if (m.message_type === 'audio' && m.transcription !== undefined) {
+    return m.transcription ? `(audio) «${m.transcription}»` : '(audio, no speech detected)';
   }
-  const texto = m.text ? String(m.text).trim() : '';
-  if (texto && !looksLikeBlob(texto)) return texto;
+  const text = m.text ? String(m.text).trim() : '';
+  if (text && !looksLikeBlob(text)) return text;
 
-  const tipo = TIPOS[m.message_type] || m.message_type || 'sin texto';
-  const titulo = m.media_title && !looksLikeBlob(m.media_title) ? `: ${m.media_title}` : '';
-  return `(${tipo}${titulo})`;
+  const type = TYPE_LABELS[m.message_type] || m.message_type || 'no text';
+  const title = m.media_title && !looksLikeBlob(m.media_title) ? `: ${m.media_title}` : '';
+  return `(${type}${title})`;
 }
 
 /**
- * Los estados (las historias de 24h) vienen mezclados con los mensajes y se ven
- * igual que un DM, aunque no te los mandaron a vos: se publican para todos los
- * contactos. WhatsApp los marca con la dirección reservada `status@broadcast`,
- * así que no hay que adivinar nada — sólo mostrarlo.
+ * Statuses (24-hour stories) come mixed in with messages and look just like a one-to-one
+ * message, even though nobody sent them to you: they're posted to all contacts. WhatsApp marks
+ * them with the reserved address `status@broadcast`, so there's nothing to guess — just show it.
  */
-const esEstado = (m) => String(m.sender_jid || '').includes('status@broadcast');
+const isStatus = (m) => String(m.sender_jid || '').includes('status@broadcast');
 
 function formatMessages(rows, { withChat }) {
-  if (rows.length === 0) return 'Sin resultados.';
+  if (rows.length === 0) return 'No results.';
   return rows
     .map((m) => {
       const where = withChat ? ` [${m.chat_name || m.chat_jid}]` : '';
-      const marca = esEstado(m) ? ' [estado]' : '';
-      return `${m.timestamp || '?'}${where}${marca} ${senderLabel(m)}: ${messageBody(m)}`;
+      const mark = isStatus(m) ? ' [status]' : '';
+      return `${m.timestamp || '?'}${where}${mark} ${senderLabel(m)}: ${messageBody(m)}`;
     })
     .join('\n');
 }
 
 /**
- * Compara el archivo contra WhatsApp Desktop EN VIVO y avisa si quedó atrás.
+ * Compares the archive against WhatsApp Desktop LIVE and warns if it fell behind.
  *
- * `wacrawl doctor` lee la fuente real en ~1s, así que siempre podemos saber
- * cuánto nos falta — aunque traerlo cueste un sync completo de ~5min y por eso
- * no se pueda hacer dentro de un tool call.
+ * `wacrawl doctor` reads the real source in ~1 s, so we can always tell how far behind we
+ * are — even though catching up costs a full ~5 min sync, which is why it can't happen inside
+ * a tool call.
  */
 async function freshnessNote() {
-  let archivo;
+  let archived;
   try {
     const [row] = await runSQL(`SELECT max(ts) AS t FROM messages WHERE deleted_at IS NULL`);
-    archivo = row?.t;
+    archived = row?.t;
   } catch {
     return '';
   }
-  if (!archivo) return '';
+  if (!archived) return '';
 
-  let fuente;
+  let source;
   try {
     const doc = JSON.parse(await runWacrawl(['--sync', 'never', 'doctor']));
-    fuente = Date.parse(doc?.desktop?.newest_message) / 1000;
+    source = Date.parse(doc?.desktop?.newest_message) / 1000;
   } catch {
     return '';
   }
-  if (!Number.isFinite(fuente)) return '';
+  if (!Number.isFinite(source)) return '';
 
-  const minutos = Math.round((fuente - archivo) / 60);
-  if (minutos < 15) return '';
+  const minutes = Math.round((source - archived) / 60);
+  if (minutes < 15) return '';
 
-  const desfasaje = minutos < 120 ? `${minutos} min` : `${Math.round(minutos / 60)} h`;
+  const lag = minutes < 120 ? `${minutes} min` : `${Math.round(minutes / 60)} h`;
   return (
-    `\n\n⚠️ El archivo está ${desfasaje} atrás de WhatsApp: hay mensajes más nuevos que todavía no entraron` +
-    ` (el sync corre cada 6h y tarda ~5 min, no se puede hacer al vuelo).` +
-    ` Para lo de último momento, mirá WhatsApp directamente.`
+    `\n\n⚠️ The archive is ${lag} behind WhatsApp: there are newer messages that haven't been imported yet` +
+    ' (the sync runs every 6 h and takes ~5 min, so it can\'t be done on the fly).' +
+    ' For anything very recent, use recent_messages or look at WhatsApp directly.'
   );
 }
 
-/** Filtros comunes a las búsquedas. */
-async function commonFilters({ chat, desde, hasta, de_mi }) {
+/** Filters shared by the searches. */
+async function commonFilters({ chat, since, until, fromMe }) {
   const where = ['m.deleted_at IS NULL'];
-  if (chat) where.push(`m.chat_jid IN (${(await variantes(await resolveChatJID(chat))).map(sqlString).join(', ')})`);
-  if (desde) where.push(`m.ts >= ${toEpoch(desde, 'desde')}`);
-  if (hasta) where.push(`m.ts < ${toEpoch(hasta, 'hasta')}`);
-  if (typeof de_mi === 'boolean') where.push(`m.from_me = ${de_mi ? 1 : 0}`);
+  if (chat) where.push(`m.chat_jid IN (${(await jidVariants(await resolveChatJID(chat))).map(sqlString).join(', ')})`);
+  if (since) where.push(`m.ts >= ${toEpoch(since, 'since')}`);
+  if (until) where.push(`m.ts < ${toEpoch(until, 'until')}`);
+  if (typeof fromMe === 'boolean') where.push(`m.from_me = ${fromMe ? 1 : 0}`);
   return where;
 }
 
@@ -1165,208 +1198,209 @@ async function commonFilters({ chat, desde, hasta, de_mi }) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Guía a nivel servidor (campo `instructions` del handshake MCP). Es el lugar
- * formal para lo que no cabe en la descripción de cada tool: cómo interpretar
- * los datos y cuándo NO confiar en ellos. Las cifras salen de medir este
- * archivo, no de estimaciones.
+ * Server-level guidance (the `instructions` field of the MCP handshake). It's the formal place
+ * for what doesn't fit in each tool's description: how to read the data and when NOT to trust
+ * it. The figures come from measuring real archives, not from estimates.
  */
-const SERVER_INSTRUCTIONS = `Acceso al WhatsApp local del usuario: un archivo histórico (sólo lectura) más WhatsApp Desktop en vivo. Cómo interpretar los resultados:
+const SERVER_INSTRUCTIONS = `Access to the user's local WhatsApp: a read-only archive plus WhatsApp Desktop live. How to read the results:
 
-PROFUNDIDAD: __PROFUNDIDAD__ Si no encontrás algo viejo, decí que no está en el archivo local — no que no existe.
+DEPTH: __DEPTH__ If you can't find something old, say it isn't in the local archive — not that it doesn't exist.
 
-FRESCURA: el archivo se sincroniza cada 6h y un sync tarda minutos, así que NO se puede refrescar durante una consulta. Las tools avisan cuando detectan mensajes más nuevos sin importar. Para "¿me contestó recién?" usá mensajes_recientes, que lee WhatsApp en vivo.
+FRESHNESS: the archive syncs every 6 h and a sync takes minutes, so it can NOT be refreshed during a query. Tools warn when they detect newer messages that haven't been imported yet. For "did they just reply?" use recent_messages, which reads WhatsApp live.
 
-QUIÉN DIJO QUÉ: en chats individuales la atribución es confiable. En grupos, muchos mensajes de gente no agendada aparecen como "(no identificado · <jid>@lid)": WhatsApp no guarda su nombre. Ese lid es estable por persona (sirve para saber que dos mensajes son del mismo desconocido) pero NO para ponerle nombre. Nunca inventes de quién es un mensaje así, ni lo atribuyas al dueño del chat. Los "[estado]" son historias publicadas, no mensajes dirigidos al usuario.
+WHO SAID WHAT: in one-to-one chats attribution is reliable. In groups, many messages from people who aren't in the user's contacts show up as "(unidentified · <jid>@lid)": WhatsApp doesn't store their name. That lid is stable per person (it tells you two messages came from the same unknown person) but it does NOT give you a name. Never guess who sent such a message, and never attribute it to the chat's owner. "[status]" items are published stories, not messages sent to the user.
 
-BÚSQUEDA: usá buscar_whatsapp primero (índice full-text, palabras completas). Si devuelve poco o nada, reintentá con busqueda_profunda, que matchea subcadenas. Los conteos son exactos sobre todo el archivo; los mensajes mostrados están topeados por 'limit', así que una síntesis de un período largo sale de una MUESTRA — decilo en vez de presentarla como completa. Si un nombre no aparece, la persona puede estar agendada con un apodo: preguntá, no adivines.
+SEARCH: use search_messages first (full-text index, whole words). If it returns little or nothing, retry with deep_search, which matches substrings. Counts are exact over the whole archive; the messages shown are capped by 'limit', so a summary of a long period comes from a SAMPLE — say so instead of presenting it as complete. If a name doesn't show up, the person may be saved under a nickname: ask, don't guess.
 
-ADJUNTOS: imágenes, PDFs y documentos Word se pueden MIRAR/LEER con ver_archivos y SACAR a una carpeta con exportar_archivo. Estas dos tools miran WhatsApp EN VIVO: los adjuntos NO tienen las 6 h de atraso del archivo — nunca uses el atraso como explicación de por qué falta un adjunto. Si una tool dice que un adjunto NO está descargado, decíselo así al usuario: tiene que abrir el chat en WhatsApp Desktop y tocar el archivo (los grandes no se bajan solos); esperar no lo resuelve. __ARCHIVOS__ AUDIOS: si la transcripción local está instalada, las notas de voz aparecen como (audio) «texto» y también salen en las búsquedas (sección "En audios"). Es transcripción automática con Whisper: el sentido es confiable, pero los nombres propios y términos en inglés pueden salir mal — no los cites como exactos. Al buscar un NOMBRE en audios, si hay pocos resultados probá también cómo suena mal escrito (ej. "Viatik" → "viatic", "Lucho" → "lucio"): la transcripción falla justo en los nombres poco comunes. Si un audio aparece como "(audio)" sin texto, todavía no se transcribió: usá transcribir_audios. "(audio sin voz detectable)" es silencio o ruido.
+ATTACHMENTS: images, PDFs and Word documents can be LOOKED AT/READ with view_attachments and COPIED to a normal folder with export_attachments. These two tools also look at WhatsApp LIVE: attachments do NOT have the archive's 6-hour lag — never use the lag to explain a missing attachment. If a tool says an attachment was NOT downloaded, tell the user exactly that: they have to open the chat in WhatsApp Desktop and click the file (large files don't download on their own); waiting won't fix it. __FILES__ VOICE NOTES: if local transcription is installed, voice notes appear as (audio) «text» and also show up in searches (section "In voice notes"). It's automatic transcription with Whisper: the gist is reliable, but proper names and foreign words can come out wrong — don't quote them as exact. When searching voice notes for a NAME and there are few results, also try how it might come out misspelled (e.g. a company name like "Viatik" can come out as "viatic"): transcription fails precisely on unusual names. If a voice note shows as "(audio)" with no text, it hasn't been transcribed yet: use transcribe_audio. "(audio, no speech detected)" is silence or noise.
 
-ESCRITURA: enviar_mensaje ENVÍA de verdad (si el usuario lo activó en esta Mac). Usala sólo cuando el usuario pidió explícitamente mandar/enviar, mostrándole antes destinatario y texto exacto; si dice redactar o preparar, usá preparar_mensaje. Nunca reintentes un envío que respondió \"no pude confirmar\". Para borradores: preparar_mensaje (uno) o cola_mensajes (varios; abre el siguiente cuando detecta que el usuario mandó el anterior). Abre WhatsApp con el texto escrito y el usuario decide si lo manda. Para varios mensajes usá SIEMPRE cola_mensajes, nunca varios preparar_mensaje seguidos: WhatsApp pierde el borrador anterior al abrir otro chat. Con preparar_mensaje y cola_mensajes nunca digas que enviaste algo: decí que quedó listo para que lo revise y lo mande. Sólo enviar_mensaje con respuesta \"✓ Enviado\" es un envío. Si una barrera bloquea un borrador (límite, texto repetido, STOP), explicá el motivo; no intentes esquivarla reformulando el texto o cambiando el destinatario.`;
+WRITING: send_message really SENDS (if the user turned it on on this Mac). Use it only when the user explicitly asked to send, after showing them the exact recipient and text; if they say write, draft or prepare, use draft_message. Never retry a send that answered "Couldn't confirm". For drafts: draft_message (one) or draft_queue (several; it opens the next one when it detects the user sent the previous one). They open WhatsApp with the text typed in and the user decides whether to send it. For several messages ALWAYS use draft_queue, never several draft_message calls in a row: WhatsApp loses the previous draft when another chat opens. With draft_message and draft_queue never say you sent something: say it's ready for them to review and send. Only send_message answering "✓ Sent" is a send. If a safeguard blocks a draft (limit, repeated text, STOP), explain why; don't try to get around it by rewording the text or changing the recipient.`;
+
+const DATE = 'YYYY-MM-DD or RFC3339';
 
 const TOOLS = [
   {
-    name: 'buscar_whatsapp',
+    name: 'search_messages',
     description:
-      'Busca texto en el archivo local de mensajes de WhatsApp usando el índice full-text. Rápido; es la búsqueda por defecto. Matchea palabras completas — si buscás fragmentos o no aparece lo que esperabas, usá busqueda_profunda.',
+      "Searches the local WhatsApp message archive with the full-text index, including transcribed voice notes. Fast; it's the default search. It matches whole words — for fragments, or if what you expected doesn't show up, use deep_search.",
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Texto a buscar (se busca como frase).' },
-        chat: { type: 'string', description: 'Opcional: limitar a un chat, por nombre o por JID.' },
-        desde: { type: 'string', description: 'Opcional: sólo mensajes posteriores. YYYY-MM-DD o RFC3339.' },
-        hasta: { type: 'string', description: 'Opcional: sólo mensajes anteriores. YYYY-MM-DD o RFC3339.' },
-        de_mi: { type: 'boolean', description: 'Opcional: true = sólo míos, false = sólo recibidos. Omitir para ambos.' },
-        limit: { type: 'integer', description: 'Máximo de mensajes a mostrar (default 50, máx 500).' },
+        query: { type: 'string', description: 'Text to search for (searched as a phrase).' },
+        chat: { type: 'string', description: 'Optional: limit to one chat, by name or JID.' },
+        since: { type: 'string', description: `Optional: only messages after this date. ${DATE}.` },
+        until: { type: 'string', description: `Optional: only messages before this date. ${DATE}.` },
+        from_me: { type: 'boolean', description: 'Optional: true = only mine, false = only received. Omit for both.' },
+        limit: { type: 'integer', description: 'Maximum messages to show (default 50, max 500).' },
       },
       required: ['query'],
     },
   },
   {
-    name: 'listar_chats',
+    name: 'list_chats',
     description:
-      'Lista los chats archivados (individuales y grupos), con la fecha del último mensaje, cantidad de mensajes y no leídos. Por defecto ordena por actividad más reciente, así que sirve para responder "mis últimas conversaciones". Con `filtro`, sólo los que contienen ese texto en el nombre.',
+      'Lists the archived chats (one-to-one and groups) with the date of the last message, the message count and unread messages. Sorted by most recent activity by default, so it answers "my latest conversations". With `filter`, only the chats whose name contains that text.',
     inputSchema: {
       type: 'object',
       properties: {
-        filtro: { type: 'string', description: 'Opcional: subcadena a buscar en el nombre del chat (case-insensitive).' },
-        orden: {
+        filter: { type: 'string', description: 'Optional: substring to look for in the chat name (case-insensitive).' },
+        sort: {
           type: 'string',
-          enum: ['recientes', 'mensajes'],
-          description: '`recientes` (default) = los de actividad más reciente primero. `mensajes` = los de más mensajes primero.',
+          enum: ['recent', 'messages'],
+          description: '`recent` (default) = most recent activity first. `messages` = most messages first.',
         },
-        solo_no_leidos: { type: 'boolean', description: 'Opcional: sólo chats con mensajes sin leer.' },
-        limit: { type: 'integer', description: 'Máximo de chats a devolver (default 100, máx 2000).' },
+        unread_only: { type: 'boolean', description: 'Optional: only chats with unread messages.' },
+        limit: { type: 'integer', description: 'Maximum chats to return (default 100, max 2000).' },
       },
     },
   },
   {
-    name: 'busqueda_profunda',
+    name: 'deep_search',
     description:
-      'Búsqueda exhaustiva por subcadena sobre TODOS los mensajes, sin usar el índice full-text. Más lenta que buscar_whatsapp pero encuentra coincidencias parciales dentro de palabras. Usala cuando buscar_whatsapp devuelve poco, o para contar/barrer todo.',
+      'Exhaustive substring search over ALL messages, without the full-text index. Slower than search_messages but finds partial matches inside words. Use it when search_messages returns little, or to count or sweep everything.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Texto a buscar. Por defecto se busca como frase literal (case-insensitive).' },
-        todas_las_palabras: {
+        query: { type: 'string', description: 'Text to search for. By default it is matched as a literal phrase (case-insensitive).' },
+        all_words: {
           type: 'boolean',
-          description: 'Si es true, busca mensajes que contengan TODAS las palabras de `query` en cualquier orden, en vez de la frase exacta.',
+          description: 'If true, finds messages that contain ALL the words in `query`, in any order, instead of the exact phrase.',
         },
-        chat: { type: 'string', description: 'Opcional: limitar a un chat, por nombre o por JID.' },
-        desde: { type: 'string', description: 'Opcional: sólo mensajes posteriores. YYYY-MM-DD o RFC3339.' },
-        hasta: { type: 'string', description: 'Opcional: sólo mensajes anteriores. YYYY-MM-DD o RFC3339.' },
-        de_mi: { type: 'boolean', description: 'Opcional: true = sólo míos, false = sólo recibidos. Omitir para ambos.' },
-        limit: { type: 'integer', description: 'Máximo de mensajes a mostrar (default 50, máx 500). El total de coincidencias se informa igual.' },
+        chat: { type: 'string', description: 'Optional: limit to one chat, by name or JID.' },
+        since: { type: 'string', description: `Optional: only messages after this date. ${DATE}.` },
+        until: { type: 'string', description: `Optional: only messages before this date. ${DATE}.` },
+        from_me: { type: 'boolean', description: 'Optional: true = only mine, false = only received. Omit for both.' },
+        limit: { type: 'integer', description: 'Maximum messages to show (default 50, max 500). The total number of matches is reported anyway.' },
       },
       required: ['query'],
     },
   },
   {
-    name: 'mensajes_recientes',
+    name: 'recent_messages',
     description:
-      'Lee los mensajes MÁS NUEVOS directamente de WhatsApp Desktop, en vivo (incluye lo que llegó hace segundos). Usala para "¿me contestó?", "qué me llegó recién", "últimos mensajes de este chat". Las otras tools leen el archivo, que va hasta 6h atrás; esta no. A cambio no tiene búsqueda full-text ni historial profundo.',
+      'Reads the NEWEST messages straight from WhatsApp Desktop, live (including what arrived seconds ago). Use it for "did they reply?", "what just came in", "latest messages in this chat". The other tools read the archive, which can be up to 6 h behind; this one is not. In exchange, it has no full-text search or deep history.',
     inputSchema: {
       type: 'object',
       properties: {
-        chat: { type: 'string', description: 'Opcional: limitar a un chat por nombre (subcadena, case-insensitive). Sin esto, trae lo último de todos los chats.' },
-        minutos: { type: 'integer', description: 'Opcional: sólo mensajes de los últimos N minutos.' },
-        solo_recibidos: { type: 'boolean', description: 'Opcional: true = sólo lo que me mandaron, ignorando lo que escribí yo.' },
-        limit: { type: 'integer', description: 'Máximo de mensajes (default 30, máx 200).' },
+        chat: { type: 'string', description: 'Optional: limit to one chat by name (substring, case-insensitive). Without it, returns the latest across all chats.' },
+        minutes: { type: 'integer', description: 'Optional: only messages from the last N minutes.' },
+        received_only: { type: 'boolean', description: 'Optional: true = only what others sent me, ignoring what I wrote.' },
+        limit: { type: 'integer', description: 'Maximum messages (default 30, max 200).' },
       },
     },
   },
   {
-    name: 'ver_archivos',
+    name: 'view_attachments',
     description:
-      'Muestra las imágenes y documentos que se mandaron en un chat, para poder MIRARLOS o LEERLOS (no sólo saber que existen). Word, RTF, OpenDocument y texto se devuelven como texto completo. Los PDF se ven como imagen de su primera página. Incluye lo que llegó hace minutos (mira WhatsApp en vivo, no sólo el archivo). Sólo existen los archivos que hay en esta Mac: los que WhatsApp Desktop descargó desde que se vinculó, y los del histórico del iPhone si se importó.',
+      "Shows the images and documents sent in a chat so you can LOOK AT or READ them (not just know they exist). Word, RTF, OpenDocument and text files come back as full text. PDFs come back as an image of their first page. Includes what arrived minutes ago (it also looks at WhatsApp live, not just the archive). Only the files on this Mac exist: the ones WhatsApp Desktop downloaded since it was linked, plus the iPhone history's if it was imported.",
     inputSchema: {
       type: 'object',
       properties: {
-        chat: { type: 'string', description: 'Opcional: limitar a un chat, por nombre o por JID.' },
-        tipo: { type: 'string', enum: ['imagen', 'documento', 'todos'], description: 'Qué traer. Default: todos.' },
-        contiene: { type: 'string', description: 'Opcional: parte del nombre del archivo o del texto que lo acompaña.' },
-        desde: { type: 'string', description: 'Opcional: sólo posteriores. YYYY-MM-DD o RFC3339.' },
-        hasta: { type: 'string', description: 'Opcional: sólo anteriores. YYYY-MM-DD o RFC3339.' },
-        limit: { type: 'integer', description: 'Máximo de archivos (default 3, máx 10). Son imágenes: pedí pocas.' },
+        chat: { type: 'string', description: 'Optional: limit to one chat, by name or JID.' },
+        type: { type: 'string', enum: ['image', 'document', 'all'], description: 'What to fetch. Default: all.' },
+        contains: { type: 'string', description: 'Optional: part of the file name or of the text that came with it.' },
+        since: { type: 'string', description: `Optional: only newer ones. ${DATE}.` },
+        until: { type: 'string', description: `Optional: only older ones. ${DATE}.` },
+        limit: { type: 'integer', description: 'Maximum files (default 3, max 10). They are images: ask for few.' },
       },
     },
   },
   {
-    name: 'exportar_archivo',
+    name: 'export_attachments',
     description:
-      'Copia un adjunto de WhatsApp a una carpeta normal (por defecto ~/Downloads), con su nombre original si es un documento, y devuelve la ruta, para poder USARLO. Incluye lo que llegó hace minutos (mira WhatsApp en vivo): subirlo, adjuntarlo, mandarlo a otra herramienta. Distinto de ver_archivos, que sólo permite mirarlo. Sirve para cualquier tipo de archivo, también los que no se pueden mostrar (videos, audios, planillas).',
+      "Copies a WhatsApp attachment to a normal folder (~/Downloads by default) — with its original name if it's a document — and returns the path, so it can be USED: uploaded, attached, handed to another tool. Includes what arrived minutes ago (it also looks at WhatsApp live). Unlike view_attachments, which only lets you look at it. Works for any file type, including ones that can't be shown (videos, audio, spreadsheets).",
     inputSchema: {
       type: 'object',
       properties: {
-        chat: { type: 'string', description: 'Opcional: limitar a un chat, por nombre o por JID.' },
-        contiene: { type: 'string', description: 'Opcional: parte del NOMBRE del archivo (ej. "gacetilla") o del texto que lo acompaña.' },
-        tipo: {
+        chat: { type: 'string', description: 'Optional: limit to one chat, by name or JID.' },
+        contains: { type: 'string', description: 'Optional: part of the file NAME (e.g. "invoice") or of the text that came with it.' },
+        type: {
           type: 'string',
-          enum: ['imagen', 'documento', 'audio', 'video', 'todos'],
-          description: 'Qué tipo de adjunto. Default: todos.',
+          enum: ['image', 'document', 'audio', 'video', 'all'],
+          description: 'Attachment type. Default: all.',
         },
-        desde: { type: 'string', description: 'Opcional: sólo posteriores. YYYY-MM-DD o RFC3339.' },
-        hasta: { type: 'string', description: 'Opcional: sólo anteriores. YYYY-MM-DD o RFC3339.' },
-        destino: { type: 'string', description: 'Carpeta donde copiarlo. Default: ~/Downloads.' },
-        limit: { type: 'integer', description: 'Máximo de archivos a exportar (default 1, máx 20).' },
+        since: { type: 'string', description: `Optional: only newer ones. ${DATE}.` },
+        until: { type: 'string', description: `Optional: only older ones. ${DATE}.` },
+        destination: { type: 'string', description: 'Folder to copy it to. Default: ~/Downloads.' },
+        limit: { type: 'integer', description: 'Maximum files to export (default 1, max 20).' },
       },
     },
   },
   {
-    name: 'preparar_mensaje',
+    name: 'draft_message',
     description:
-      'Abre WhatsApp Desktop en un chat individual con un mensaje YA ESCRITO en la caja de texto, listo para que el usuario lo revise y lo mande apretando Enter. NO ENVÍA NADA: sólo deja el borrador. Usala cuando el usuario pida redactar o preparar un mensaje para alguien. No sirve para grupos. Tiene límites duros (pocos por minuto/hora, y nunca el mismo texto a varios chats).',
+      "Opens WhatsApp Desktop on a one-to-one chat with a message ALREADY TYPED in the text box, ready for the user to review and send by pressing Enter. It SENDS NOTHING: it only leaves the draft. Use it when the user asks you to write or prepare a message for someone. Doesn't work for groups. Has hard limits (few per minute/hour, and never the same text to several chats).",
     inputSchema: {
       type: 'object',
       properties: {
-        chat: { type: 'string', description: 'Destinatario: nombre del chat, JID, o número de teléfono con código de país.' },
-        texto: { type: 'string', description: 'El mensaje a dejar escrito. Máx 2000 caracteres.' },
+        chat: { type: 'string', description: 'Recipient: chat name, JID, or phone number with country code.' },
+        text: { type: 'string', description: 'The message to leave typed. Max 2000 characters.' },
       },
-      required: ['chat', 'texto'],
+      required: ['chat', 'text'],
     },
   },
   {
-    name: 'enviar_mensaje',
+    name: 'send_message',
     description:
-      'ENVÍA de verdad un mensaje de WhatsApp a un chat individual, desde la app oficial de la Mac, y verifica que haya salido. ' +
-      'Usala SÓLO si el usuario pidió explícitamente ENVIAR/MANDAR (no "redactar" ni "preparar": para eso es preparar_mensaje) ' +
-      'y después de mostrarle el texto exacto y el destinatario. No sirve para grupos. Si responde que no pudo confirmar el envío, ' +
-      'NO la vuelvas a llamar con el mismo mensaje: puede haber salido igual; pedile al usuario que mire WhatsApp.',
+      'Really SENDS a WhatsApp message to a one-to-one chat, from the official Mac app, and verifies it went out. ' +
+      'Use it ONLY if the user explicitly asked to SEND it (not "write" or "draft": that is draft_message) ' +
+      "and after showing them the exact text and recipient. Doesn't work for groups. Off by default: the user turns it on per Mac. " +
+      "If it says it couldn't confirm the send, do NOT call it again with the same message: it may have gone out anyway; ask the user to check WhatsApp.",
     inputSchema: {
       type: 'object',
       properties: {
-        chat: { type: 'string', description: 'Destinatario: nombre del chat, JID, o número con código de país.' },
-        texto: { type: 'string', description: 'El mensaje exacto a enviar. Máx 2000 caracteres.' },
+        chat: { type: 'string', description: 'Recipient: chat name, JID, or phone number with country code.' },
+        text: { type: 'string', description: 'The exact message to send. Max 2000 characters.' },
       },
-      required: ['chat', 'texto'],
+      required: ['chat', 'text'],
     },
   },
   {
-    name: 'cola_mensajes',
+    name: 'draft_queue',
     description:
-      'Para preparar VARIOS mensajes seguidos. Abre el primer borrador en WhatsApp y, cada vez que detecta que el usuario lo mandó, abre el siguiente solo. NO ENVÍA NADA: cada mensaje lo manda el usuario con Enter, a su ritmo. Si no manda uno en 10 min, la cola se pausa. Acciones: crear (con la lista), estado, saltar (pasa al siguiente sin mandar el actual), reanudar, cancelar. Para un único mensaje usá preparar_mensaje.',
+      "For preparing SEVERAL messages in a row. Opens the first draft in WhatsApp and, each time it detects the user sent it, opens the next one by itself. It SENDS NOTHING: the user sends each message with Enter, at their own pace. If one isn't sent within 10 min, the queue pauses. Actions: create (with the list), status, skip (move on without sending the current one), resume, cancel. For a single message use draft_message.",
     inputSchema: {
       type: 'object',
       properties: {
-        accion: { type: 'string', enum: ['crear', 'estado', 'saltar', 'reanudar', 'cancelar'] },
-        mensajes: {
+        action: { type: 'string', enum: ['create', 'status', 'skip', 'resume', 'cancel'] },
+        messages: {
           type: 'array',
-          description: 'Sólo para crear: lista de {chat, texto}, en el orden en que se van a abrir.',
+          description: 'Only for create: a list of {chat, text}, in the order they will open.',
           items: {
             type: 'object',
-            properties: { chat: { type: 'string' }, texto: { type: 'string' } },
-            required: ['chat', 'texto'],
+            properties: { chat: { type: 'string' }, text: { type: 'string' } },
+            required: ['chat', 'text'],
           },
         },
       },
-      required: ['accion'],
+      required: ['action'],
     },
   },
   {
-    name: 'transcribir_audios',
+    name: 'transcribe_audio',
     description:
-      'Transcribe notas de voz que todavía no tienen texto, con Whisper corriendo en esta Mac (no sale nada de la computadora). Los audios ya transcriptos aparecen solos como (audio) «texto» en leer_chat y en las búsquedas: usá esto sólo si ves "(audio)" sin texto y hace falta saber qué dice. Tarda unos segundos por audio (más ~5 s la primera vez).',
+      'Transcribes voice notes that don\'t have text yet, with Whisper running on this Mac (nothing leaves the computer). Voice notes that are already transcribed show up on their own as (audio) «text» in read_chat and in searches: use this only if you see "(audio)" with no text and need to know what it says. Takes a few seconds per voice note (plus ~5 s the first time).',
     inputSchema: {
       type: 'object',
       properties: {
-        chat: { type: 'string', description: 'Opcional: audios de un chat, por nombre o JID.' },
-        desde: { type: 'string', description: 'Opcional: sólo posteriores. YYYY-MM-DD o RFC3339.' },
-        hasta: { type: 'string', description: 'Opcional: sólo anteriores. YYYY-MM-DD o RFC3339.' },
-        limit: { type: 'integer', description: 'Máximo de audios (default 5, máx 15), los más recientes.' },
+        chat: { type: 'string', description: 'Optional: voice notes from one chat, by name or JID.' },
+        since: { type: 'string', description: `Optional: only newer ones. ${DATE}.` },
+        until: { type: 'string', description: `Optional: only older ones. ${DATE}.` },
+        limit: { type: 'integer', description: 'Maximum voice notes (default 5, max 15), the most recent ones.' },
       },
     },
   },
   {
-    name: 'leer_chat',
+    name: 'read_chat',
     description:
-      'Lee los mensajes de un chat en orden cronológico (del más viejo al más nuevo), con remitente y fecha.',
+      "Reads a chat's messages in chronological order (oldest to newest), with sender and date.",
     inputSchema: {
       type: 'object',
       properties: {
-        chat: { type: 'string', description: 'Nombre del chat o JID.' },
-        desde: { type: 'string', description: 'Opcional: sólo mensajes posteriores. YYYY-MM-DD o RFC3339.' },
-        hasta: { type: 'string', description: 'Opcional: sólo mensajes anteriores. YYYY-MM-DD o RFC3339.' },
-        limit: { type: 'integer', description: 'Máximo de mensajes (default 100, máx 1000).' },
+        chat: { type: 'string', description: 'Chat name or JID.' },
+        since: { type: 'string', description: `Optional: only messages after this date. ${DATE}.` },
+        until: { type: 'string', description: `Optional: only messages before this date. ${DATE}.` },
+        limit: { type: 'integer', description: 'Maximum messages (default 100, max 1000).' },
       },
       required: ['chat'],
     },
@@ -1374,61 +1408,61 @@ const TOOLS = [
 ];
 
 const handlers = {
-  async buscar_whatsapp({ query, chat, desde, hasta, de_mi, limit }) {
-    if (!query || !String(query).trim()) throw new Error('`query` es obligatorio.');
+  async search_messages({ query, chat, since, until, from_me, limit }) {
+    if (!query || !String(query).trim()) throw new Error('`query` is required.');
     const max = clampLimit(limit, 50, 500);
 
     const from = 'messages_fts f JOIN messages m ON m.rowid = f.rowid';
     const jid = chat ? await resolveChatJID(chat) : null;
-    const where = await commonFilters({ chat: jid, desde, hasta, de_mi });
+    const where = await commonFilters({ chat: jid, since, until, fromMe: from_me });
     where.push(`messages_fts MATCH ${sqlString(ftsPhrase(String(query).trim()))}`);
     const clause = where.join(' AND ');
 
     const total = await countDistinct(from, clause);
-    const rows = await adjuntarTranscripciones(await selectMessages(from, clause, 'DESC', max));
-    const audios = await buscarEnAudios({ terms: [String(query).trim()], jid, desde, hasta, de_mi, limite: Math.min(max, 20) });
+    const rows = await attachTranscriptions(await selectMessages(from, clause, 'DESC', max));
+    const voice = await searchVoiceNotes({ terms: [String(query).trim()], jid, since, until, fromMe: from_me, limit: Math.min(max, 20) });
 
-    const scope = chat ? ` en ${chat}` : '';
-    const shown = total > rows.length ? ` (mostrando ${rows.length})` : '';
-    const hint = total === 0 && !audios?.total ? '\n\nSugerencia: probá busqueda_profunda, que busca subcadenas y suele encontrar más.' : '';
-    return `${total} mensaje(s) para "${query}"${scope}${shown}:\n\n${formatMessages(rows, { withChat: true })}${seccionAudios(audios)}${hint}${await freshnessNote()}`;
+    const scope = chat ? ` in ${chat}` : '';
+    const shown = total > rows.length ? ` (showing ${rows.length})` : '';
+    const hint = total === 0 && !voice?.total ? '\n\nTip: try deep_search, which matches substrings and usually finds more.' : '';
+    return `${total} message(s) for "${query}"${scope}${shown}:\n\n${formatMessages(rows, { withChat: true })}${voiceNotesSection(voice)}${hint}${await freshnessNote()}`;
   },
 
-  async listar_chats({ filtro, orden, solo_no_leidos, limit }) {
+  async list_chats({ filter, sort, unread_only, limit }) {
     const max = clampLimit(limit, 100, 2000);
-    const modo = orden === 'mensajes' ? 'mensajes' : 'recientes';
+    const mode = sort === 'messages' ? 'messages' : 'recent';
 
-    let chats = await listChats(modo);
-    if (filtro) {
-      const needle = String(filtro).toLowerCase();
+    let chats = await listChats(mode);
+    if (filter) {
+      const needle = String(filter).toLowerCase();
       chats = chats.filter((c) => (c.name || '').toLowerCase().includes(needle));
     }
-    if (solo_no_leidos) chats = chats.filter((c) => c.unread_count > 0);
+    if (unread_only) chats = chats.filter((c) => c.unread_count > 0);
 
     const shown = chats.slice(0, max);
-    if (shown.length === 0) return `Sin chats${filtro ? ` que coincidan con "${filtro}"` : ''}.`;
+    if (shown.length === 0) return `No chats${filter ? ` matching "${filter}"` : ''}.`;
 
     const lines = shown.map((c) => {
-      const kind = { group: 'grupo', dm: 'dm', status: 'estados', newsletter: 'canal' }[c.kind] || c.kind;
-      const unread = c.unread_count ? `, ${c.unread_count} sin leer` : '';
-      const last = c.last_message_at ? `último ${c.last_message_at}` : 'sin mensajes';
-      return `• ${c.name || '(sin nombre)'} — ${kind} — ${last} — ${c.message_count} mensajes${unread} — ${c.jid}`;
+      const kind = { group: 'group', dm: 'dm', status: 'status', newsletter: 'channel' }[c.kind] || c.kind;
+      const unread = c.unread_count ? `, ${c.unread_count} unread` : '';
+      const last = c.last_message_at ? `last ${c.last_message_at}` : 'no messages';
+      return `• ${c.name || '(no name)'} — ${kind} — ${last} — ${c.message_count} messages${unread} — ${c.jid}`;
     });
-    const criterio = modo === 'mensajes' ? 'más mensajes primero' : 'actividad más reciente primero';
-    const more = chats.length > shown.length ? `\n… y ${chats.length - shown.length} chats más.` : '';
+    const order = mode === 'messages' ? 'most messages first' : 'most recent activity first';
+    const more = chats.length > shown.length ? `\n… and ${chats.length - shown.length} more chats.` : '';
     return (
-      `${shown.length} de ${chats.length} chat(s)${filtro ? ` que coinciden con "${filtro}"` : ''}` +
-      ` — ordenados por ${criterio}:\n\n${lines.join('\n')}${more}${await freshnessNote()}`
+      `${shown.length} of ${chats.length} chat(s)${filter ? ` matching "${filter}"` : ''}` +
+      ` — sorted by ${order}:\n\n${lines.join('\n')}${more}${await freshnessNote()}`
     );
   },
 
-  async busqueda_profunda({ query, todas_las_palabras, chat, desde, hasta, de_mi, limit }) {
-    if (!query || !String(query).trim()) throw new Error('`query` es obligatorio.');
+  async deep_search({ query, all_words, chat, since, until, from_me, limit }) {
+    if (!query || !String(query).trim()) throw new Error('`query` is required.');
     const max = clampLimit(limit, 50, 500);
 
-    const terms = todas_las_palabras ? String(query).trim().split(/\s+/) : [String(query).trim()];
+    const terms = all_words ? String(query).trim().split(/\s+/) : [String(query).trim()];
     const jid = chat ? await resolveChatJID(chat) : null;
-    const where = await commonFilters({ chat: jid, desde, hasta, de_mi });
+    const where = await commonFilters({ chat: jid, since, until, fromMe: from_me });
     where.push('m.text IS NOT NULL');
     for (const t of terms) {
       where.push(`lower(m.text) LIKE ${sqlString(`%${likeLiteral(t.toLowerCase())}%`)} ESCAPE '\\'`);
@@ -1436,34 +1470,34 @@ const handlers = {
     const clause = where.join(' AND ');
 
     const total = await countDistinct('messages m', clause);
-    const rows = await adjuntarTranscripciones(await selectMessages('messages m', clause, 'DESC', max));
-    const audios = await buscarEnAudios({ terms, jid, desde, hasta, de_mi, limite: Math.min(max, 20) });
+    const rows = await attachTranscriptions(await selectMessages('messages m', clause, 'DESC', max));
+    const voice = await searchVoiceNotes({ terms, jid, since, until, fromMe: from_me, limit: Math.min(max, 20) });
 
-    const modo = todas_las_palabras ? 'todas las palabras' : 'frase literal';
-    const scope = chat ? ` en ${chat}` : '';
-    const shown = total > rows.length ? ` (mostrando ${rows.length})` : '';
-    return `${total} coincidencia(s) para "${query}"${scope} — ${modo}${shown}:\n\n${formatMessages(rows, { withChat: true })}${seccionAudios(audios)}${await freshnessNote()}`;
+    const mode = all_words ? 'all words' : 'literal phrase';
+    const scope = chat ? ` in ${chat}` : '';
+    const shown = total > rows.length ? ` (showing ${rows.length})` : '';
+    return `${total} match(es) for "${query}"${scope} — ${mode}${shown}:\n\n${formatMessages(rows, { withChat: true })}${voiceNotesSection(voice)}${await freshnessNote()}`;
   },
 
-  async mensajes_recientes({ chat, minutos, solo_recibidos, limit }) {
+  async recent_messages({ chat, minutes, received_only, limit }) {
     const max = clampLimit(limit, 30, 200);
 
-    // Texto, o adjuntos (imagen, video, audio, documento) aunque no tengan texto.
+    // Text, or attachments (image, video, audio, document) even without text.
     const where = ['(m.ZTEXT IS NOT NULL OR m.ZMESSAGETYPE IN (1, 2, 3, 8))'];
     if (chat) {
       where.push(`lower(cs.ZPARTNERNAME) LIKE ${sqlString(`%${likeLiteral(String(chat).toLowerCase())}%`)} ESCAPE '\\'`);
     }
-    if (Number.isFinite(minutos)) {
-      const desde = Math.floor(Date.now() / 1000) - Math.floor(minutos) * 60 - APPLE_EPOCH;
-      where.push(`m.ZMESSAGEDATE >= ${desde}`);
+    if (Number.isFinite(minutes)) {
+      const since = Math.floor(Date.now() / 1000) - Math.floor(minutes) * 60 - APPLE_EPOCH;
+      where.push(`m.ZMESSAGEDATE >= ${since}`);
     }
-    if (solo_recibidos) where.push('m.ZISFROMME = 0');
+    if (received_only) where.push('m.ZISFROMME = 0');
 
     const rows = await runLiveSQL(
       `SELECT strftime('%Y-%m-%d %H:%M', m.ZMESSAGEDATE + ${APPLE_EPOCH}, 'unixepoch', 'localtime') AS timestamp,` +
       ` cs.ZPARTNERNAME AS chat_name, m.ZISFROMME AS from_me,` +
       ` gm.ZCONTACTNAME AS member_name, gm.ZMEMBERJID AS member_jid,` +
-      ` m.ZPUSHNAME AS push_name, m.ZFROMJID AS sender_jid, m.ZTEXT AS text, m.ZMESSAGETYPE AS codigo, mi.ZMEDIALOCALPATH AS ruta_rel, mi.ZFILESIZE AS bytes` +
+      ` m.ZPUSHNAME AS push_name, m.ZFROMJID AS sender_jid, m.ZTEXT AS text, m.ZMESSAGETYPE AS code, mi.ZMEDIALOCALPATH AS rel_path, mi.ZFILESIZE AS bytes` +
       ` FROM ZWAMESSAGE m` +
       ` LEFT JOIN ZWACHATSESSION cs ON cs.Z_PK = m.ZCHATSESSION` +
       ` LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER` +
@@ -1472,394 +1506,393 @@ const handlers = {
     );
 
     if (rows.length === 0) {
-      return `Sin mensajes${chat ? ` en chats que coincidan con "${chat}"` : ''}${Number.isFinite(minutos) ? ` en los últimos ${minutos} min` : ''}.`;
+      return `No messages${chat ? ` in chats matching "${chat}"` : ''}${Number.isFinite(minutes) ? ` in the last ${minutes} min` : ''}.`;
     }
 
-    // Mismo criterio que el archivo: en grupo mandan ZCONTACTNAME/JID del
-    // miembro; en DM el remitente es la contraparte del chat.
+    // Same rule as the archive: in a group, the member's ZCONTACTNAME/JID; in a one-to-one
+    // chat, the sender is the other party.
     const lines = rows.map((m) => {
-      const cuando = m.timestamp || '?';
-      const donde = m.chat_name || '(chat sin nombre)';
-      let quien;
-      if (m.from_me) quien = 'Yo';
-      else if (m.member_name && !looksLikeBlob(m.member_name)) quien = m.member_name;
-      else if (m.member_jid) quien = `(no identificado · ${m.member_jid})`;
-      else if (m.push_name && !looksLikeBlob(m.push_name)) quien = m.push_name;
-      else quien = donde;
-      const texto = String(m.text || '').trim();
-      const legible = texto && !looksLikeBlob(texto) ? texto : '';
-      // Un documento trae su nombre en ZTEXT: sin esto parecía un mensaje de texto.
-      const tipo = { 1: 'imagen', 2: 'video', 3: 'audio', 8: 'documento' }[m.codigo];
-      const bajado = m.ruta_rel ? 'se puede ver/exportar' : `${m.bytes ? tamano(m.bytes) + ', ' : ''}NO descargado en WhatsApp Desktop: hay que tocarlo ahí para bajarlo`;
-      const cuerpo = tipo === 'documento' ? `(documento: ${legible || 'sin nombre'} — ${bajado})`
-        : tipo ? `(${tipo})${legible ? ' ' + legible : ''}` : (legible || '(archivo adjunto)');
-      return `${cuando} [${donde}] ${quien}: ${cuerpo}`;
+      const when = m.timestamp || '?';
+      const chatName = m.chat_name || '(unnamed chat)';
+      let who;
+      if (m.from_me) who = 'Me';
+      else if (m.member_name && !looksLikeBlob(m.member_name)) who = m.member_name;
+      else if (m.member_jid) who = `(unidentified · ${m.member_jid})`;
+      else if (m.push_name && !looksLikeBlob(m.push_name)) who = m.push_name;
+      else who = chatName;
+      const text = String(m.text || '').trim();
+      const readable = text && !looksLikeBlob(text) ? text : '';
+      // A document carries its name in ZTEXT: without this it looked like a text message.
+      const type = { 1: 'image', 2: 'video', 3: 'audio', 8: 'document' }[m.code];
+      const downloaded = m.rel_path ? 'can be viewed/exported' : `${m.bytes ? formatSize(m.bytes) + ', ' : ''}NOT downloaded in WhatsApp Desktop: click it there to download it`;
+      const body = type === 'document' ? `(document: ${readable || 'no name'} — ${downloaded})`
+        : type ? `(${type})${readable ? ' ' + readable : ''}` : (readable || '(attachment)');
+      return `${when} [${chatName}] ${who}: ${body}`;
     });
 
     return (
-      `${rows.length} mensaje(s) EN VIVO desde WhatsApp Desktop` +
-      `${chat ? ` en "${chat}"` : ''}${Number.isFinite(minutos) ? ` (últimos ${minutos} min)` : ''},` +
-      ` del más nuevo al más viejo:\n\n${lines.join('\n')}`
+      `${rows.length} message(s) LIVE from WhatsApp Desktop` +
+      `${chat ? ` in "${chat}"` : ''}${Number.isFinite(minutes) ? ` (last ${minutes} min)` : ''},` +
+      ` newest first:\n\n${lines.join('\n')}`
     );
   },
 
-  async ver_archivos({ chat, tipo, contiene, desde, hasta, limit }) {
+  async view_attachments({ chat, type, contains, since, until, limit }) {
     const max = clampLimit(limit, 3, 10);
-    const tipos = tipo === 'imagen' ? ['image'] : tipo === 'documento' ? ['document'] : ['image', 'document'];
-    const { filas: rows, avisoVivo, chatNoEncontrado } = await buscarAdjuntos({ chat, tipos, contiene, desde, hasta, limite: max * 3 });
-    if (chatNoEncontrado) throw new Error(`No encontré ningún chat que coincida con "${chatNoEncontrado}", ni en el archivo ni en WhatsApp en vivo.`);
+    const types = type === 'image' ? ['image'] : type === 'document' ? ['document'] : ['image', 'document'];
+    const { rows, liveWarning, chatNotFound } = await findAttachments({ chat, types, contains, since, until, limit: max * 3 });
+    if (chatNotFound) throw new Error(`No chat matches "${chatNotFound}", neither in the archive nor in WhatsApp live.`);
 
     const content = [];
-    let mostrados = 0;
-    const problemas = [];
+    let shown = 0;
+    const problems = [];
 
-    const sinDescargar = [];
+    const notDownloaded = [];
     for (const m of rows) {
-      if (mostrados >= max) break;
-      if (m.descargado === false) { sinDescargar.push(avisoNoDescargado(m)); continue; }
-      const ruta = m.media_path;
-      if (!ruta || !fs.existsSync(ruta)) {
-        problemas.push(`${m.timestamp} ${m.chat_name}: el archivo ya no está en disco`);
+      if (shown >= max) break;
+      if (m.downloaded === false) { notDownloaded.push(notDownloadedNote(m)); continue; }
+      const file = m.media_path;
+      if (!file || !fs.existsSync(file)) {
+        problems.push(`${m.timestamp} ${m.chat_name}: the file is no longer on disk`);
         continue;
       }
-      const ext = extensionDe(ruta);
-      if (EXT_TEXTO.has(ext)) {
+      const ext = detectExtension(file);
+      if (TEXT_EXTS.has(ext)) {
         try {
-          const texto = await textoDeDocumento(ruta);
-          const nombre = nombreOriginal(m) ? ` «${nombreOriginal(m)}»` : '';
+          const text = await documentText(file);
+          const name = originalName(m) ? ` «${originalName(m)}»` : '';
           content.push({
             type: 'text',
-            text: `${m.timestamp} [${m.chat_name || m.chat_jid}] ${senderLabel(m)} — documento${nombre}, texto completo:\n\n${texto || '(el documento no tiene texto)'}\n\n— fin del documento —`,
+            text: `${m.timestamp} [${m.chat_name || m.chat_jid}] ${senderLabel(m)} — document${name}, full text:\n\n${text || '(the document has no text)'}\n\n— end of document —`,
           });
-          mostrados += 1;
+          shown += 1;
         } catch (err) {
-          problemas.push(`${m.timestamp} ${m.chat_name}: no se pudo leer el ${ext} (${err.message.slice(0, 80)})`);
+          problems.push(`${m.timestamp} ${m.chat_name}: couldn't read the ${ext} (${err.message.slice(0, 80)})`);
         }
         continue;
       }
-      if (!EXT_SOPORTADAS.has(ext)) {
-        problemas.push(`${m.timestamp} ${m.chat_name}: ${ext || 'formato desconocido'} no se puede mostrar (usá exportar_archivo)`);
+      if (!RENDERABLE_EXTS.has(ext)) {
+        problems.push(`${m.timestamp} ${m.chat_name}: ${ext || 'unknown format'} can't be shown (use export_attachments)`);
         continue;
       }
       try {
-        const data = await renderToJpeg(ruta);
-        const que = m.message_type === 'document' ? 'documento (primera página)' : 'imagen';
-        const nombre = nombreOriginal(m) ? ` «${nombreOriginal(m)}»` : '';
-        const titulo = m.media_title && !looksLikeBlob(m.media_title) ? ` — "${String(m.media_title).trim().slice(0, 120)}"` : '';
+        const data = await renderToJpeg(file);
+        const what = m.message_type === 'document' ? 'document (first page)' : 'image';
+        const name = originalName(m) ? ` «${originalName(m)}»` : '';
+        const title = m.media_title && !looksLikeBlob(m.media_title) ? ` — "${String(m.media_title).trim().slice(0, 120)}"` : '';
         content.push({
           type: 'text',
-          text: `${m.timestamp} [${m.chat_name || m.chat_jid}] ${senderLabel(m)} — ${que}${nombre}${titulo}`,
+          text: `${m.timestamp} [${m.chat_name || m.chat_jid}] ${senderLabel(m)} — ${what}${name}${title}`,
         });
         content.push({ type: 'image', data, mimeType: 'image/jpeg' });
-        mostrados += 1;
+        shown += 1;
       } catch (err) {
-        problemas.push(`${m.timestamp} ${m.chat_name}: no se pudo convertir (${err.message.slice(0, 80)})`);
+        problems.push(`${m.timestamp} ${m.chat_name}: couldn't convert it (${err.message.slice(0, 80)})`);
       }
     }
 
-    if (mostrados === 0) {
-      const detalle = (sinDescargar.length ? `\n\n${sinDescargar.join('\n')}` : '') +
-        (problemas.length ? `\n\n${problemas.join('\n')}` : '') + (avisoVivo ? `\n\n${avisoVivo}` : '');
+    if (shown === 0) {
+      const detail = (notDownloaded.length ? `\n\n${notDownloaded.join('\n')}` : '') +
+        (problems.length ? `\n\n${problems.join('\n')}` : '') + (liveWarning ? `\n\n${liveWarning}` : '');
       return (
-        `No hay archivos para mostrar${chat ? ` en "${chat}"` : ''}.` +
-        ` ${queArchivosHay()}${detalle}`
+        `No files to show${chat ? ` in "${chat}"` : ''}.` +
+        ` ${filesNote()}${detail}`
       );
     }
 
     content.unshift({
       type: 'text',
-      text: (sinDescargar.length ? `⚠️ Hay adjuntos más nuevos que coinciden pero NO están descargados:\n${sinDescargar.join('\n')}\n\n` : '') +
-        `${mostrados} archivo(s)${chat ? ` de "${chat}"` : ''}, del más nuevo al más viejo:`,
+      text: (notDownloaded.length ? `⚠️ There are newer matching attachments that are NOT downloaded:\n${notDownloaded.join('\n')}\n\n` : '') +
+        `${shown} file(s)${chat ? ` from "${chat}"` : ''}, newest first:`,
     });
-    if (problemas.length) {
-      content.push({ type: 'text', text: `\nNo se pudieron mostrar:\n${problemas.join('\n')}` });
+    if (problems.length) {
+      content.push({ type: 'text', text: `\nCouldn't show:\n${problems.join('\n')}` });
     }
-    if (avisoVivo) content.push({ type: 'text', text: `\n${avisoVivo}` });
+    if (liveWarning) content.push({ type: 'text', text: `\n${liveWarning}` });
     return content;
   },
 
-  async exportar_archivo({ chat, contiene, tipo, desde, hasta, destino, limit }) {
+  async export_attachments({ chat, contains, type, since, until, destination, limit }) {
     const max = clampLimit(limit, 1, 20);
-    const PORTIPO = {
-      imagen: ['image'], documento: ['document'], audio: ['audio'], video: ['video'],
+    const BY_TYPE = {
+      image: ['image'], document: ['document'], audio: ['audio'], video: ['video'],
     };
-    const tipos = PORTIPO[tipo] || ['image', 'document', 'audio', 'video', 'sticker'];
+    const types = BY_TYPE[type] || ['image', 'document', 'audio', 'video', 'sticker'];
 
-    const dir = destino
-      ? path.resolve(destino.replace(/^~(?=$|\/)/, os.homedir()))
+    const dir = destination
+      ? path.resolve(destination.replace(/^~(?=$|\/)/, os.homedir()))
       : path.join(os.homedir(), 'Downloads');
     if (!fs.existsSync(dir)) {
-      throw new Error(`La carpeta de destino no existe: ${dir}`);
+      throw new Error(`The destination folder doesn't exist: ${dir}`);
     }
 
-    const { filas: rows, avisoVivo, chatNoEncontrado } = await buscarAdjuntos({ chat, tipos, contiene, desde, hasta, limite: max * 3 });
-    if (chatNoEncontrado) throw new Error(`No encontré ningún chat que coincida con "${chatNoEncontrado}", ni en el archivo ni en WhatsApp en vivo.`);
+    const { rows, liveWarning, chatNotFound } = await findAttachments({ chat, types, contains, since, until, limit: max * 3 });
+    if (chatNotFound) throw new Error(`No chat matches "${chatNotFound}", neither in the archive nor in WhatsApp live.`);
 
-    const hechos = [];
-    const fallados = [];
+    const done = [];
+    const failed = [];
 
-    const sinDescargar = [];
+    const notDownloaded = [];
     for (const m of rows) {
-      if (hechos.length >= max) break;
-      if (m.descargado === false) { sinDescargar.push(avisoNoDescargado(m)); continue; }
+      if (done.length >= max) break;
+      if (m.downloaded === false) { notDownloaded.push(notDownloadedNote(m)); continue; }
       if (!m.media_path || !fs.existsSync(m.media_path)) {
-        fallados.push(`${m.timestamp} ${m.chat_name}: el archivo no está en disco`);
+        failed.push(`${m.timestamp} ${m.chat_name}: the file is not on disk`);
         continue;
       }
-      // Nombre legible: el archivo original es un UUID, y media_title no sirve
-      // (a veces trae el texto del mensaje, a veces un blob base64).
-      const limpio = (s) => String(s || '').replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+      // A readable name: the original file is a UUID, and media_title doesn't help
+      // (sometimes it has the message text, sometimes a base64 blob).
+      const clean = (s) => String(s || '').replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 40);
       const base = [
         (m.timestamp || '').replace(/[: ]/g, '-'),
-        limpio(m.chat_name),
-        limpio(senderLabel(m)),
+        clean(m.chat_name),
+        clean(senderLabel(m)),
       ].filter(Boolean).join('_');
 
-      // Documentos: con su nombre ORIGINAL (WhatsApp lo guarda). El resto: fecha_chat_remitente.
-      let ext = extensionDe(m.media_path);
-      let raiz = base;
-      const original = nombreOriginal(m);
+      // Documents keep their ORIGINAL name (WhatsApp stores it). Everything else: date_chat_sender.
+      let ext = detectExtension(m.media_path);
+      let stem = base;
+      const original = originalName(m);
       if (original) {
-        const limpioArchivo = original.replace(/[\/:\0]/g, '-').trim();
-        ext = path.extname(limpioArchivo) || ext;
-        raiz = limpioArchivo.slice(0, limpioArchivo.length - path.extname(limpioArchivo).length);
+        const cleanName = original.replace(/[\/:\0]/g, '-').trim();
+        ext = path.extname(cleanName) || ext;
+        stem = cleanName.slice(0, cleanName.length - path.extname(cleanName).length);
       }
-      let salida = path.join(dir, `${raiz}${ext}`);
-      for (let i = 2; fs.existsSync(salida); i += 1) salida = path.join(dir, `${raiz} (${i})${ext}`);
+      let out = path.join(dir, `${stem}${ext}`);
+      for (let i = 2; fs.existsSync(out); i += 1) out = path.join(dir, `${stem} (${i})${ext}`);
 
       try {
-        fs.copyFileSync(m.media_path, salida);
-        const kb = Math.round(fs.statSync(salida).size / 1024);
-        const acompana = original ? m.media_title : m.text;
-        const contexto = acompana && !looksLikeBlob(acompana) ? `\n   mensaje: "${String(acompana).trim().slice(0, 120)}"` : '';
-        hechos.push(
-          `• ${salida}\n   ${kb} KB — ${m.timestamp} en "${m.chat_name}", de ${senderLabel(m)}${contexto}`
+        fs.copyFileSync(m.media_path, out);
+        const kb = Math.round(fs.statSync(out).size / 1024);
+        const caption = original ? m.media_title : m.text;
+        const context = caption && !looksLikeBlob(caption) ? `\n   message: "${String(caption).trim().slice(0, 120)}"` : '';
+        done.push(
+          `• ${out}\n   ${kb} KB — ${m.timestamp} in "${m.chat_name}", from ${senderLabel(m)}${context}`
         );
       } catch (err) {
-        fallados.push(`${m.timestamp} ${m.chat_name}: ${err.message.slice(0, 80)}`);
+        failed.push(`${m.timestamp} ${m.chat_name}: ${err.message.slice(0, 80)}`);
       }
     }
 
-    if (hechos.length === 0) {
-      if (sinDescargar.length) return sinDescargar.join('\n');
+    if (done.length === 0) {
+      if (notDownloaded.length) return notDownloaded.join('\n');
       return (
-        (avisoVivo ? `${avisoVivo}\n\n` : '') +
-        `No encontré ningún archivo para exportar${chat ? ` en "${chat}"` : ''}` +
-        `${contiene ? ` que mencione "${contiene}"` : ''}.` +
-        ` ${queArchivosHay()}` +
-        (fallados.length ? `\n\n${fallados.join('\n')}` : '')
+        (liveWarning ? `${liveWarning}\n\n` : '') +
+        `I didn't find any file to export${chat ? ` in "${chat}"` : ''}` +
+        `${contains ? ` mentioning "${contains}"` : ''}.` +
+        ` ${filesNote()}` +
+        (failed.length ? `\n\n${failed.join('\n')}` : '')
       );
     }
 
     return (
-      // Si el más nuevo que coincide no está descargado, se dice PRIMERO: si no, el modelo
-      // usa el archivo viejo que sí se exportó como si fuera el pedido.
-      (sinDescargar.length ? `⚠️ El/los más nuevo(s) que coinciden NO están descargados — lo exportado abajo es OTRO archivo, más viejo:\n${sinDescargar.join('\n')}\n\n` : '') +
-      `${hechos.length} archivo(s) copiado(s) a ${dir}. Verificá que fecha, chat y nombre sean los que pidió el usuario antes de usarlo:\n\n${hechos.join('\n')}` +
-      (avisoVivo ? `\n\n${avisoVivo}` : '') +
-      (fallados.length ? `\n\nNo se pudieron copiar:\n${fallados.join('\n')}` : '')
+      // If the newest match isn't downloaded, say so FIRST: otherwise the model uses the older
+      // file that did get exported as if it were the one asked for.
+      (notDownloaded.length ? `⚠️ The newest match(es) are NOT downloaded — what's exported below is a DIFFERENT, older file:\n${notDownloaded.join('\n')}\n\n` : '') +
+      `${done.length} file(s) copied to ${dir}. Check that the date, chat and name are what the user asked for before using it:\n\n${done.join('\n')}` +
+      (liveWarning ? `\n\n${liveWarning}` : '') +
+      (failed.length ? `\n\nCouldn't copy:\n${failed.join('\n')}` : '')
     );
   },
 
-  async preparar_mensaje({ chat, texto }) {
-    if (!chat || !String(chat).trim()) throw new Error('`chat` es obligatorio.');
-    const cuerpo = String(texto || '').trim();
-    if (!cuerpo) throw new Error('`texto` está vacío.');
-    if (cuerpo.length > LIMITES.largoMax) {
-      throw new Error(`El texto tiene ${cuerpo.length} caracteres; el máximo es ${LIMITES.largoMax}.`);
+  async draft_message({ chat, text }) {
+    if (!chat || !String(chat).trim()) throw new Error('`chat` is required.');
+    const body = String(text || '').trim();
+    if (!body) throw new Error('`text` is empty.');
+    if (body.length > LIMITS.maxLength) {
+      throw new Error(`The text has ${body.length} characters; the maximum is ${LIMITS.maxLength}.`);
     }
 
-    if (cola && cola.estado === 'activa') {
-      throw new Error('Hay una cola de mensajes en curso: abrir otro borrador pisaría el que el usuario está por mandar. Esperá a que termine o cancelala con cola_mensajes.');
+    if (draftQueue && draftQueue.status === 'active') {
+      throw new Error('A draft queue is running: opening another draft would overwrite the one the user is about to send. Wait for it to finish or cancel it with draft_queue.');
     }
-    const destino = await telefonoDeChat(chat);
-    const { nombre, conocido } = destino;
+    const recipient = await recipientFor(chat);
 
-    const bloqueo = chequearBarreras(destino.telefono, cuerpo);
-    if (bloqueo) throw new Error(bloqueo);
+    const blocked = checkSafeguards(recipient.phone, body);
+    if (blocked) throw new Error(blocked);
 
-    await abrirBorrador(destino, cuerpo);
+    await openDraft(recipient, body);
 
-    const aviso = conocido
+    const warning = recipient.known
       ? ''
-      : '\n\n⚠️ Nunca hablaste con este número. Verificá que sea el correcto antes de mandar.';
+      : '\n\n⚠️ You have never talked to this number. Check it is the right one before sending.';
     return (
-      `Abrí WhatsApp en el chat con "${nombre}" con el mensaje escrito.\n` +
-      `NO se envió nada: el usuario lo revisa y aprieta Enter si está bien.${aviso}`
+      `Opened WhatsApp on the chat with "${recipient.name}" with the message typed in.\n` +
+      `Nothing was sent: the user reviews it and presses Enter if it's right.${warning}`
     );
   },
 
-  async enviar_mensaje({ chat, texto }) {
-    const lim = cargarLimites();
-    if (!lim.permitirEnvio) {
+  async send_message({ chat, text }) {
+    const lim = loadLimits();
+    if (!lim.allowSending) {
       throw new Error(
-        'El envío automático está desactivado en esta Mac (por defecto lo está). Mientras tanto usá preparar_mensaje, ' +
-        'que deja el mensaje escrito para que el usuario lo mande. Para activarlo, el usuario pone "permitirEnvio": true en ~/.wacrawl/limites.json.'
+        'Sending is turned off on this Mac (it is by default). Meanwhile use draft_message, which leaves the message ' +
+        'typed for the user to send. To turn sending on, the user runs ./enable-sending.sh from the wacrawl-mcp folder.'
       );
     }
-    if (!chat || !String(chat).trim()) throw new Error('`chat` es obligatorio.');
-    const cuerpo = String(texto || '').trim();
-    if (!cuerpo) throw new Error('`texto` está vacío.');
-    if (cuerpo.length > lim.largoMax) throw new Error(`El texto tiene ${cuerpo.length} caracteres; el máximo es ${lim.largoMax}.`);
-    if (cola && cola.estado === 'activa') {
-      throw new Error('Hay una cola de borradores en curso: enviar ahora pisaría el que el usuario está por mandar.');
+    if (!chat || !String(chat).trim()) throw new Error('`chat` is required.');
+    const body = String(text || '').trim();
+    if (!body) throw new Error('`text` is empty.');
+    if (body.length > lim.maxLength) throw new Error(`The text has ${body.length} characters; the maximum is ${lim.maxLength}.`);
+    if (draftQueue && draftQueue.status === 'active') {
+      throw new Error('A draft queue is running: sending now would overwrite the draft the user is about to send.');
     }
 
-    const destino = await telefonoDeChat(chat);
-    const bloqueo = chequearBarreras(destino.telefono, cuerpo, { enCola: 'envio' });
-    if (bloqueo) throw new Error(bloqueo);
+    const recipient = await recipientFor(chat);
+    const blocked = checkSafeguards(recipient.phone, body, { mode: 'send' });
+    if (blocked) throw new Error(blocked);
 
-    const antes = Date.now();
-    await abrirBorrador(destino, cuerpo, { envio: true });
-    await sleep(1500);   // que WhatsApp abra el chat y ponga el texto
+    const before = Date.now();
+    await openDraft(recipient, body, { send: true });
+    await sleep(1500);   // let WhatsApp open the chat and fill in the text
 
-    // Un segundo Enter es seguro: si el primero mandó, la caja quedó vacía y no manda nada.
-    let enviado = false;
-    for (let intento = 1; intento <= 2 && !enviado; intento += 1) {
-      await presionarEnter();
-      for (let i = 0; i < 12 && !enviado; i += 1) {
+    // A second Enter is safe: if the first one sent it, the box is empty and nothing goes out.
+    let sent = false;
+    for (let attempt = 1; attempt <= 2 && !sent; attempt += 1) {
+      await pressEnter();
+      for (let i = 0; i < 12 && !sent; i += 1) {
         await sleep(500);
-        enviado = await detectarEnvio(destino, antes);
+        sent = await detectSent(recipient, before);
       }
     }
 
-    const aviso = destino.conocido ? '' : ' (era un número con el que nunca habías hablado)';
-    if (!enviado) {
+    const note = recipient.known ? '' : ' (a number you had never talked to)';
+    if (!sent) {
       return (
-        `No pude confirmar que el mensaje a "${destino.nombre}" haya salido: apreté Enter pero no apareció en WhatsApp. ` +
-        `Quedó escrito en el chat; que el usuario lo revise y lo mande. NO reintentes: podría duplicarse.`
+        `Couldn't confirm that the message to "${recipient.name}" went out: I pressed Enter but it didn't show up in WhatsApp. ` +
+        "It's typed in the chat; have the user check it and send it. Do NOT retry: it could be sent twice."
       );
     }
-    return `✓ Enviado a "${destino.nombre}"${aviso}, verificado en WhatsApp:\n\n${cuerpo}`;
+    return `✓ Sent to "${recipient.name}"${note}, verified in WhatsApp:\n\n${body}`;
   },
 
-  async cola_mensajes({ accion, mensajes }) {
-    if (accion === 'estado') return resumenCola();
+  async draft_queue({ action, messages }) {
+    if (action === 'status') return queueSummary();
 
-    if (accion === 'cancelar') {
-      if (!cola) return 'No hay ninguna cola.';
-      clearInterval(cola.timer);
-      cola.estado = 'cancelada';
-      return `Cola cancelada. El borrador que esté abierto queda en WhatsApp; no se abre ninguno más.\n\n${resumenCola()}`;
+    if (action === 'cancel') {
+      if (!draftQueue) return 'There is no queue.';
+      clearInterval(draftQueue.timer);
+      draftQueue.status = 'cancelled';
+      return `Queue cancelled. The draft that's open stays in WhatsApp; no more will open.\n\n${queueSummary()}`;
     }
 
-    if (accion === 'saltar') {
-      if (!cola || !['activa', 'pausada'].includes(cola.estado)) return 'No hay una cola en curso.';
-      const actual = cola.items.find((x) => x.estado === 'abierto');
-      if (actual) actual.estado = 'salteado';
-      cola.estado = 'activa';
-      await abrirSiguiente();
-      return resumenCola();
+    if (action === 'skip') {
+      if (!draftQueue || !['active', 'paused'].includes(draftQueue.status)) return 'There is no queue running.';
+      const current = draftQueue.items.find((x) => x.status === 'open');
+      if (current) current.status = 'skipped';
+      draftQueue.status = 'active';
+      await openNext();
+      return queueSummary();
     }
 
-    if (accion === 'reanudar') {
-      if (!cola || cola.estado !== 'pausada') return 'No hay una cola pausada.';
-      cola.estado = 'activa';
-      cola.motivo = null;
-      const actual = cola.items.find((x) => x.estado === 'abierto');
-      // si se pausó por demora, reabrimos el mismo borrador (WhatsApp pudo haberlo perdido)
-      if (actual) { actual.estado = 'pendiente'; }
-      await abrirSiguiente();
-      return resumenCola();
+    if (action === 'resume') {
+      if (!draftQueue || draftQueue.status !== 'paused') return 'There is no paused queue.';
+      draftQueue.status = 'active';
+      draftQueue.reason = null;
+      const current = draftQueue.items.find((x) => x.status === 'open');
+      // if it paused because of the wait, reopen that same draft (WhatsApp may have lost it)
+      if (current) { current.status = 'pending'; }
+      await openNext();
+      return queueSummary();
     }
 
-    if (accion !== 'crear') throw new Error(`Acción desconocida: ${accion}`);
+    if (action !== 'create') throw new Error(`Unknown action: ${action}`);
 
-    if (cola && ['activa', 'pausada'].includes(cola.estado)) {
-      throw new Error('Ya hay una cola en curso. Cancelala o esperá a que termine antes de crear otra.');
+    if (draftQueue && ['active', 'paused'].includes(draftQueue.status)) {
+      throw new Error('There is already a queue running. Cancel it or wait for it to finish before creating another one.');
     }
-    if (fs.existsSync(KILL_SWITCH)) throw new Error(`Borradores DESACTIVADOS: existe ${KILL_SWITCH}.`);
-    const lim = cargarLimites();
-    if (!Array.isArray(mensajes) || mensajes.length === 0) throw new Error('`mensajes` está vacío.');
-    if (mensajes.length > lim.colaMax) {
-      throw new Error(`La cola tiene ${mensajes.length} mensajes; el máximo es ${lim.colaMax} (ajustable en ~/.wacrawl/limites.json).`);
+    if (fs.existsSync(KILL_SWITCH)) throw new Error(`Drafts are DISABLED: ${KILL_SWITCH} exists.`);
+    const lim = loadLimits();
+    if (!Array.isArray(messages) || messages.length === 0) throw new Error('`messages` is empty.');
+    if (messages.length > lim.queueMax) {
+      throw new Error(`The queue has ${messages.length} messages; the maximum is ${lim.queueMax} (adjustable in ~/.wacrawl/limits.json).`);
     }
 
-    // Validar TODO antes de abrir el primero: mejor fallar acá que a mitad de camino.
+    // Validate EVERYTHING before opening the first one: better to fail here than halfway through.
     const items = [];
-    const problemas = [];
-    const vistos = new Map();
-    for (const [n, m] of mensajes.entries()) {
-      const texto = String(m.texto || '').trim();
+    const problems = [];
+    const seen = new Map();
+    for (const [n, m] of messages.entries()) {
+      const text = String(m.text || '').trim();
       try {
-        if (!texto) throw new Error('texto vacío');
-        if (texto.length > lim.largoMax) throw new Error(`texto de ${texto.length} caracteres (máx ${lim.largoMax})`);
-        const d = await telefonoDeChat(m.chat);
-        if (vistos.has(d.telefono)) throw new Error(`repite destinatario con el #${vistos.get(d.telefono)}`);
-        vistos.set(d.telefono, n + 1);
-        if (lim.antiDifusion) {
-          const igual = items.find((i) => normalizarTexto(i.texto) === normalizarTexto(texto));
-          if (igual) throw new Error(`mismo texto que el de ${igual.nombre} (anti-difusión)`);
+        if (!text) throw new Error('empty text');
+        if (text.length > lim.maxLength) throw new Error(`text has ${text.length} characters (max ${lim.maxLength})`);
+        const r = await recipientFor(m.chat);
+        if (seen.has(r.phone)) throw new Error(`same recipient as #${seen.get(r.phone)}`);
+        seen.set(r.phone, n + 1);
+        if (lim.antiBroadcast) {
+          const same = items.find((i) => normalizeText(i.text) === normalizeText(text));
+          if (same) throw new Error(`same text as the one for ${same.name} (anti-broadcast)`);
         }
-        items.push({ ...d, texto, estado: 'pendiente' });
+        items.push({ ...r, text, status: 'pending' });
       } catch (err) {
-        problemas.push(`#${n + 1} ${m.chat}: ${err.message}`);
+        problems.push(`#${n + 1} ${m.chat}: ${err.message}`);
       }
     }
-    if (problemas.length) {
-      throw new Error(`No armé la cola; hay que corregir esto primero:\n${problemas.join('\n')}`);
+    if (problems.length) {
+      throw new Error(`I didn't build the queue; fix this first:\n${problems.join('\n')}`);
     }
-    if (items.length > lim.porHora) {
-      throw new Error(`La cola tiene ${items.length} mensajes y el límite es ${lim.porHora} por hora (ajustable en ~/.wacrawl/limites.json).`);
+    if (items.length > lim.perHour) {
+      throw new Error(`The queue has ${items.length} messages and the limit is ${lim.perHour} per hour (adjustable in ~/.wacrawl/limits.json).`);
     }
 
-    cola = { items, estado: 'activa', creada: Date.now() };
-    cola.timer = setInterval(vigilarCola, POLL_MS);
-    cola.timer.unref?.();
-    await abrirSiguiente();
+    draftQueue = { items, status: 'active', createdAt: Date.now() };
+    draftQueue.timer = setInterval(watchQueue, POLL_MS);
+    draftQueue.timer.unref?.();
+    await openNext();
 
     return (
-      `Cola armada con ${items.length} mensajes. Abrí el primero en WhatsApp (${items[0].nombre}).\n` +
-      `El usuario lo revisa y aprieta Enter; cuando detecto que salió, abro el siguiente solo. ` +
-      `NO se envía nada automáticamente.\n\n${resumenCola()}`
+      `Queue ready with ${items.length} messages. I opened the first one in WhatsApp (${items[0].name}).\n` +
+      'The user reviews it and presses Enter; when I detect it went out, I open the next one. ' +
+      `Nothing is sent automatically.\n\n${queueSummary()}`
     );
   },
 
-  async transcribir_audios({ chat, desde, hasta, limit }) {
+  async transcribe_audio({ chat, since, until, limit }) {
     const max = clampLimit(limit, 5, 15);
     const jid = chat ? await resolveChatJID(chat) : null;
-    const where = await commonFilters({ chat: jid, desde, hasta });
+    const where = await commonFilters({ chat: jid, since, until });
     where.push(`m.message_type = 'audio'`);
-    const rows = await adjuntarTranscripciones(await selectMessages('messages m', where.join(' AND '), 'DESC', max));
-    if (!rows.length) return `No hay audios${chat ? ` en "${chat}"` : ''} en ese período.`;
+    const rows = await attachTranscriptions(await selectMessages('messages m', where.join(' AND '), 'DESC', max));
+    if (!rows.length) return `No voice notes${chat ? ` in "${chat}"` : ''} in that period.`;
 
-    const conArchivo = (r) => r.media_path && fs.existsSync(r.media_path);
-    const faltan = rows.filter((r) => r.transcripcion === undefined && conArchivo(r));
-    const sinArchivo = rows.filter((r) => r.transcripcion === undefined && !conArchivo(r));
-    const yaEstaban = rows.length - faltan.length - sinArchivo.length;
+    const hasFile = (r) => r.media_path && fs.existsSync(r.media_path);
+    const missing = rows.filter((r) => r.transcription === undefined && hasFile(r));
+    const noFile = rows.filter((r) => r.transcription === undefined && !hasFile(r));
+    const already = rows.length - missing.length - noFile.length;
 
-    if (faltan.length) {
-      const res = await correrTranscriptor(whisperListo(), faltan.map((r) => ({
+    if (missing.length) {
+      const res = await runTranscriber(whisperReady(), missing.map((r) => ({
         msg_id: r.message_id, chat_jid: r.chat_jid, chat_name: r.chat_name, sender_name: r.sender_name,
         from_me: r.from_me, ts: r.ts, media_path: r.media_path,
       })));
-      for (const r of faltan) {
+      for (const r of missing) {
         const k = `${r.message_id}|${r.chat_jid}`;
-        if (k in res) r.transcripcion = res[k];
+        if (k in res) r.transcription = res[k];
       }
     }
 
-    const nuevos = faltan.filter((r) => r.transcripcion !== undefined).length;
-    const fallidos = faltan.length - nuevos;
-    const notas = [];
-    if (yaEstaban) notas.push(`${yaEstaban} ya estaban transcriptos`);
-    if (nuevos) notas.push(`${nuevos} transcriptos ahora`);
-    if (fallidos) notas.push(`${fallidos} no se pudieron leer (archivo de audio dañado o incompleto; se puede escuchar en WhatsApp)`);
-    if (sinArchivo.length) notas.push(`${sinArchivo.length} sin archivo en esta Mac (WhatsApp Desktop no los descargó; suelen ser anteriores a vincularlo)`);
-    rows.reverse();   // del más viejo al más nuevo, como se escucharían
-    return `${rows.length} audio(s)${chat ? ` en "${rows[0].chat_name || chat}"` : ''} — ${notas.join(', ')}.\n` +
-      `Ojo: es transcripción automática; los nombres propios pueden salir mal.\n\n${formatMessages(rows, { withChat: !chat })}`;
+    const fresh = missing.filter((r) => r.transcription !== undefined).length;
+    const failed = missing.length - fresh;
+    const notes = [];
+    if (already) notes.push(`${already} were already transcribed`);
+    if (fresh) notes.push(`${fresh} transcribed now`);
+    if (failed) notes.push(`${failed} couldn't be read (damaged or incomplete audio file; it can be played in WhatsApp)`);
+    if (noFile.length) notes.push(`${noFile.length} have no file on this Mac (WhatsApp Desktop didn't download them; usually from before it was linked)`);
+    rows.reverse();   // oldest to newest, the way you'd listen to them
+    return `${rows.length} voice note(s)${chat ? ` in "${rows[0].chat_name || chat}"` : ''} — ${notes.join(', ')}.\n` +
+      `Note: this is automatic transcription; proper names may come out wrong.\n\n${formatMessages(rows, { withChat: !chat })}`;
   },
 
-  async leer_chat({ chat, desde, hasta, limit }) {
-    if (!chat) throw new Error('`chat` es obligatorio.');
+  async read_chat({ chat, since, until, limit }) {
+    if (!chat) throw new Error('`chat` is required.');
     const jid = await resolveChatJID(chat);
-    const where = await commonFilters({ chat: jid, desde, hasta });
+    const where = await commonFilters({ chat: jid, since, until });
     const clause = where.join(' AND ');
 
-    const rows = await adjuntarTranscripciones(await selectMessages('messages m', clause, 'ASC', clampLimit(limit, 100, 1000)));
+    const rows = await attachTranscriptions(await selectMessages('messages m', clause, 'ASC', clampLimit(limit, 100, 1000)));
     const name = rows[0]?.chat_name || chat;
-    return `${rows.length} mensaje(s) en "${name}" (${jid}), en orden cronológico:\n\n${formatMessages(rows, { withChat: false })}${await freshnessNote()}`;
+    return `${rows.length} message(s) in "${name}" (${jid}), in chronological order:\n\n${formatMessages(rows, { withChat: false })}${await freshnessNote()}`;
   },
 };
 
@@ -1877,8 +1910,8 @@ async function handleRequest(req) {
       return {
         protocolVersion: req.params?.protocolVersion || '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'wacrawl-mcp', version: '2.1.0' },
-        instructions: SERVER_INSTRUCTIONS.replace('__PROFUNDIDAD__', profundidad()).replace('__ARCHIVOS__', queArchivosHay()),
+        serverInfo: { name: 'wacrawl-mcp', version: '3.0.0' },
+        instructions: SERVER_INSTRUCTIONS.replace('__DEPTH__', depthNote()).replace('__FILES__', filesNote()),
       };
     case 'ping':
       return {};
@@ -1887,28 +1920,28 @@ async function handleRequest(req) {
     case 'tools/call': {
       const { name, arguments: args } = req.params || {};
       const handler = handlers[name];
-      if (!handler) throw new Error(`Tool desconocida: ${name}`);
-      // Las tools devuelven texto, o ya un array de contenido MCP cuando
-      // mandan imágenes junto con su contexto.
-      // Un fallo de la tool (chat ambiguo, sin número, límite alcanzado) va como
-      // resultado con isError, NO como error de protocolo: Claude Desktop muestra
-      // los errores de protocolo como un "failed" pelado y el modelo nunca ve el
-      // motivo. Así veía "falló" sin saber que el nombre coincidía con 6 chats.
+      if (!handler) throw new Error(`Unknown tool: ${name}`);
+      // Tools return text, or an MCP content array when they send images along with their
+      // context.
+      // A tool failure (ambiguous chat, no number, limit reached) goes back as a result with
+      // isError, NOT as a protocol error: Claude Desktop shows protocol errors as a bare "failed"
+      // and the model never sees the reason. That's how it saw "failed" without knowing the
+      // name matched 6 chats.
       try {
-        const salida = await handler(args || {});
-        return { content: Array.isArray(salida) ? salida : [{ type: 'text', text: salida }] };
+        const result = await handler(args || {});
+        return { content: Array.isArray(result) ? result : [{ type: 'text', text: result }] };
       } catch (err) {
         return { content: [{ type: 'text', text: err.message || String(err) }], isError: true };
       }
     }
     default:
-      throw Object.assign(new Error(`Método no soportado: ${req.method}`), { code: -32601 });
+      throw Object.assign(new Error(`Unsupported method: ${req.method}`), { code: -32601 });
   }
 }
 
-// Importable desde check.sh para probar el renderizado sin levantar el server.
+// Importable from check.sh to test the rendering without starting the server.
 if (require.main !== module) {
-  module.exports = { messageBody, senderLabel, formatMessages, looksLikeBlob, TIPOS, detectarEnvio };
+  module.exports = { messageBody, senderLabel, formatMessages, looksLikeBlob, TYPE_LABELS, detectSent };
   return;
 }
 
@@ -1917,9 +1950,9 @@ let pending = 0;
 let stdinEnded = false;
 
 function maybeExit() {
-  // NO usar process.exit(): trunca lo que quede sin vaciar en stdout, y una
-  // imagen en base64 no entra de una sola pasada. Soltamos stdin y dejamos que
-  // node salga solo cuando ya no tenga nada pendiente.
+  // Do NOT use process.exit(): it truncates whatever hasn't been flushed to stdout yet, and a
+  // base64 image doesn't fit in a single write. Release stdin and let node exit on its own once
+  // nothing is pending.
   if (stdinEnded && pending === 0) {
     process.exitCode = 0;
     process.stdin.pause();
@@ -1942,7 +1975,7 @@ process.stdin.on('data', (chunk) => {
       continue;
     }
 
-    // Notificaciones (sin id) no llevan respuesta.
+    // Notifications (no id) get no response.
     if (req.id === undefined || req.id === null) continue;
 
     pending += 1;

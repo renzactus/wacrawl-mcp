@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <!-- Calls the wrapper, not wacrawl directly: the wrapper detects the
+         "different event" error, recovers on its own from a backup, and alerts
+         you if something fails. Without it, a broken sync goes unnoticed for days. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__WRAPPER__</string>
+    </array>
+
+    <!-- Every 6 hours, at fixed times. Not StartInterval: its timer pauses while the
+         Mac sleeps, so one night asleep left the archive 16 h behind. A missed
+         calendar time runs as soon as the Mac wakes up. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>15</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.wacrawl/sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.wacrawl/sync.err.log</string>
+</dict>
+</plist>
