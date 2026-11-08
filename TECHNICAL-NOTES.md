@@ -312,6 +312,15 @@ another candidate — before, looking up a contact by name came back as "matches
 extract it (Spotlight doesn't index WhatsApp's container, PyObjC isn't there), and rendering also works
 for scanned ones. Only the first page comes out.
 
+## Keeping private data out of the repo
+
+The repository is public, and it's developed against a real WhatsApp. `.githooks/pre-commit` blocks a
+commit whose added lines contain phone numbers, WhatsApp IDs, email addresses, the full names of your own
+chats (read from your local archive) or anything listed in `~/.wacrawl/private-words.txt`. Turn it on
+once per clone with `git config core.hooksPath .githooks`; `.githooks/pre-commit --all` scans every
+tracked file. False positives go in `~/.wacrawl/allowed-words.txt`, which is local, so it doesn't publish
+them either. `CLAUDE.md` tells AI assistants the same rules.
+
 ## Tests
 
 There's no test suite; `check.sh` covers rendering fidelity. To try things without side effects:

@@ -1,0 +1,79 @@
+#!/bin/bash
+# pre-commit — this repository is PUBLIC, and it's developed against a real WhatsApp.
+#
+# Blocks a commit whose added lines contain phone numbers, WhatsApp IDs, email addresses,
+# the full names of your own WhatsApp chats (read from your local wacrawl archive, if there
+# is one) or any word listed in ~/.wacrawl/private-words.txt.
+#
+#   git config core.hooksPath .githooks      turn it on (once per clone)
+#   .githooks/pre-commit --all               scan every tracked file, not just this commit
+#
+# A false positive goes in ~/.wacrawl/allowed-words.txt (local, so it isn't published either).
+
+set -uo pipefail
+export LC_ALL=en_US.UTF-8
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+ADDED="$TMP/added"
+
+# What gets checked: only the lines this commit adds, leaving out this hook's own folder.
+if [ "${1:-}" = "--all" ]; then
+  git ls-files -z -- . ':(exclude).githooks' | xargs -0 cat > "$ADDED" 2>/dev/null
+else
+  git diff --cached -U0 --no-color --diff-filter=ACMR -- . ':(exclude).githooks' \
+    | grep -E '^\+' | grep -vE '^\+\+\+ ' | cut -c2- > "$ADDED"
+fi
+[ -s "$ADDED" ] || exit 0
+
+ALLOWED="$TMP/allowed"
+grep -vE '^[[:space:]]*(#|$)' "$HOME/.wacrawl/allowed-words.txt" > "$ALLOWED" 2>/dev/null || : > "$ALLOWED"
+
+FOUND=0
+report() {   # $1 = what it is; stdin = the matches
+  local hits
+  hits="$(sort -fu | grep -vixF -f "$ALLOWED")"
+  [ -n "$hits" ] || return 0
+  [ "$FOUND" = 1 ] || echo "This repository is public, and this commit would publish:"
+  FOUND=1
+  echo "  $1:"
+  printf '%s\n' "$hits" | head -10 | sed 's/^/    /'
+}
+
+# WhatsApp IDs
+grep -oE '[0-9]{6,}(-[0-9]+)?@(s\.whatsapp\.net|g\.us|c\.us|lid)' "$ADDED" > "$TMP/jids"
+report "WhatsApp IDs" < "$TMP/jids"
+
+# Phone numbers: international format, or a long run of digits (minus known constants)
+{ grep -oE '\+[0-9][0-9 ().-]{6,18}[0-9]' "$ADDED"
+  grep -oE '(^|[^0-9.])[0-9]{10,15}([^0-9]|$)' "$ADDED" | grep -oE '[0-9]{10,15}'
+} | grep -vxE '1230768000|978307200' > "$TMP/phones"
+report "phone numbers" < "$TMP/phones"
+
+# Email addresses (no-reply and example addresses are fine)
+grep -oiE '[a-z0-9._%+-]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}' "$ADDED" \
+  | grep -viE 'no-?reply|@example\.(com|org|net)$|@(s\.whatsapp\.net|g\.us|c\.us)$|^git@' > "$TMP/emails"
+report "email addresses" < "$TMP/emails"
+
+# Full names of your WhatsApp chats (two words or more, letters only), from your local archive
+for db in "$HOME/.wacrawl/wacrawl.db" "$HOME/.wacrawl/historico/wacrawl.db"; do
+  [ -f "$db" ] && sqlite3 -readonly "$db" "SELECT DISTINCT name FROM chats WHERE name LIKE '% %'" 2>/dev/null
+done | grep -E "^[[:alpha:]][[:alpha:] .'-]{4,}[[:alpha:]]$" | grep -E '[[:alpha:]]{2,} +[[:alpha:]]{2,}' \
+  | sort -fu > "$TMP/names"
+if [ -s "$TMP/names" ]; then
+  grep -oiwF -f "$TMP/names" "$ADDED" > "$TMP/name-hits"
+  report "names of your WhatsApp chats" < "$TMP/name-hits"
+fi
+
+# Your own list: nicknames, clients, anything else that must stay private
+if grep -vE '^[[:space:]]*(#|$)' "$HOME/.wacrawl/private-words.txt" > "$TMP/private" 2>/dev/null && [ -s "$TMP/private" ]; then
+  grep -oiwF -f "$TMP/private" "$ADDED" > "$TMP/private-hits"
+  report "words from ~/.wacrawl/private-words.txt" < "$TMP/private-hits"
+fi
+
+if [ "$FOUND" = 1 ]; then
+  echo
+  echo "✗ Commit blocked. Replace those with invented examples (e.g. \"Ana\", \"+1 555 0100\")."
+  echo "  A false positive goes in ~/.wacrawl/allowed-words.txt, one per line."
+  exit 1
+fi
+exit 0

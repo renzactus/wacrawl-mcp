@@ -1,9 +1,11 @@
 # wacrawl-mcp
 
-**Your WhatsApp, inside Claude — on your Mac.** An [MCP](https://modelcontextprotocol.io) server that lets
-Claude Desktop search every chat, read threads, look at the photos and documents people sent you,
-understand voice notes (transcribed locally), and write messages: as drafts you send yourself, or — if
-you turn it on — sent directly, with a check that they went out.
+**Plug your WhatsApp into any AI assistant — locally, on your Mac.** It's an
+[MCP](https://modelcontextprotocol.io) server, so it isn't tied to one app: any assistant that supports
+local MCP servers can search every chat, read threads, look at the photos and documents people sent you,
+understand voice notes (transcribed locally), and write messages — as drafts you send yourself or, if
+you turn it on, sent directly, with a check that they went out. The installer sets it up for Claude
+Desktop, and the examples below use Claude.
 
 Everything runs on your computer. Your chats aren't uploaded anywhere (see [Privacy](#privacy)).
 
@@ -22,6 +24,26 @@ Everything runs on your computer. Your chats aren't uploaded anywhere (see [Priv
 - *"Write personalized messages for these 6 people"* — they open one at a time, as you send each one.
 - *"Send Ana: running 10 minutes late"* — with [direct sending](#direct-sending-optional-off-by-default)
   turned on, Claude sends it and checks that it went out.
+
+## Ask for the outcome, not the search
+
+The point isn't a WhatsApp search box inside a chat. It's that you stop explaining: the assistant reads
+the conversations itself, so you skip the who, the where and the copy-pasting, and just ask for the
+result. It gets better combined with whatever else the assistant is connected to — calendar, email,
+meeting notes, your files:
+
+- *"Do what Sofía asked me for this morning, and send her the reply when I say so."* — it finds the
+  request, does the work with its other tools, and has the answer ready to go.
+- *"Do what the lawyer asked for in today's meeting."* — the meeting notes say *what*; the WhatsApp
+  thread with the lawyer brings the background nobody wrote down.
+- *"Who came to my last three birthdays? Make a list of the friends I should invite, 30 at most, and
+  invite them."* — it works out the list from those chats and queues a personal invitation for each one
+  (the safeguards won't let it send everyone the same text, and they cap how many go out per hour).
+- *"What did people ask me this week that I still haven't answered?"*
+- *"I have a call with Marcos in ten minutes. What's pending between us?"*
+- *"Put the visit the landlord confirmed on my calendar, with the address he sent."*
+
+None of these says which chat to open or which dates to look at: that's the part you no longer do.
 
 ## How it works
 
