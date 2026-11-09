@@ -90,7 +90,9 @@ One file (`server.js`), no npm dependencies, no network.
 | **Mac** with macOS 13 or newer | it doesn't run on Windows or Linux ([alternative](#windows-or-linux)) |
 | **WhatsApp Desktop** (the Mac app, not WhatsApp Web), linked to your phone | [whatsapp.com/download](https://www.whatsapp.com/download) or the App Store |
 | **Claude Desktop** | [claude.ai/download](https://claude.ai/download) |
-| **Node.js 18+** | [nodejs.org](https://nodejs.org) or `brew install node` |
+
+That's all: you don't need Node.js, git or the developer tools. If you have Node.js 18 or newer, the
+installer uses a copy of it; if not, it downloads one that only this server uses.
 
 Voice note transcription also needs an Apple Silicon Mac (M1 or later).
 
@@ -99,41 +101,51 @@ and how to read the results.
 
 ## Install
 
-**1. Clone the repo and run the installer** (in Terminal):
+Open **Terminal** (⌘Space, type *Terminal*), paste this and press Enter:
 
 ```bash
-git clone https://github.com/renzactus/wacrawl-mcp.git ~/wacrawl-mcp
-cd ~/wacrawl-mcp
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/renzactus/wacrawl-mcp/master/install.sh | bash
 ```
 
-It checks the requirements, installs `wacrawl` (verifying its checksum), builds your local archive, sets
-up an automatic sync every 6 hours, and tells you what's left. The first import takes a few minutes.
+That's the whole install. It downloads the project to `~/wacrawl-mcp`, checks the requirements, installs
+`wacrawl` (verifying its checksum), builds your local archive, sets up an automatic sync every 6 hours and
+registers the server with Claude Desktop. The first import takes a few minutes.
 
 If macOS asks whether **Terminal** can access data from other apps, allow it: that's how it reads WhatsApp.
 
-**2. Grant Full Disk Access** (macOS doesn't let a script do it):
+At the end it walks you through the two things macOS won't let a script do:
 
-System Settings → **Privacy & Security** → **Full Disk Access** → **+** → **⌘⇧G** → paste the path the
-installer showed you (it ends in `/runtime/bin/node`) → **Open** → turn it on.
+1. **Full Disk Access.** It opens the right screen and copies a path to your clipboard: click **+**,
+   press **⌘⇧G**, paste, **Open**, and turn it on.
 
-> That permission is only for a copy of node used **exclusively** by this server — not for your
-> system's node — so no other program inherits it. Almost everything works without it; you just can't
-> see what arrived seconds ago or use the draft queue.
+   > That permission is only for a copy of node used **exclusively** by this server — not for your
+   > system's node — so no other program inherits it. Almost everything works without it; you just can't
+   > see what arrived seconds ago or use the draft queue.
 
-**3. Register it with Claude, with Claude quit:**
+2. **Quit Claude Desktop with ⌘Q**, if it's open (closing the window isn't enough). The installer is
+   waiting for that: it registers the server and opens Claude again. Done.
 
-Quit Claude Desktop with **⌘Q** (closing the window isn't enough) and run:
+   > **Why it has to be quit:** Claude Desktop reads its configuration when it starts and **rewrites it
+   > when it quits**. If you edit it while the app is open, quitting erases what you added. If you stop
+   > the installer before Claude closes, or ran it from inside Claude, quit Claude and run
+   > `~/wacrawl-mcp/register.sh` in Terminal.
+
+<details>
+<summary>Rather read the code first, or install it somewhere else?</summary>
+
+The command runs [`install.sh`](install.sh). To read it before running anything, clone the repo and run
+the same installer from there:
 
 ```bash
-~/wacrawl-mcp/register.sh
+git clone https://github.com/renzactus/wacrawl-mcp.git ~/wacrawl-mcp
+~/wacrawl-mcp/install.sh
 ```
 
-Open Claude Desktop. Done.
+To install into another folder, put `WACRAWL_MCP_DIR` before `bash`:
+`curl -fsSL https://raw.githubusercontent.com/renzactus/wacrawl-mcp/master/install.sh | WACRAWL_MCP_DIR=~/somewhere bash`.
+The rest of this README assumes `~/wacrawl-mcp`.
 
-> **Why it has to be quit:** Claude Desktop reads its configuration when it starts and **rewrites it
-> when it quits**. If you edit it while the app is open, quitting erases what you added. The script
-> refuses to run if it sees Claude open. If the installer found Claude closed, it already did this step.
+</details>
 
 The server speaks plain MCP over stdio, so other MCP clients can run it too; the scripts set up Claude
 Desktop.
@@ -350,11 +362,15 @@ Automatic sync log: `~/.wacrawl/wrapper.log`.
 
 ## Update
 
+Run the install command again:
+
 ```bash
-cd ~/wacrawl-mcp && git pull
+curl -fsSL https://raw.githubusercontent.com/renzactus/wacrawl-mcp/master/install.sh | bash
 ```
 
-Quit and reopen Claude Desktop (⌘Q). There's no need to register again or to grant the permissions again.
+It updates the code wherever you installed it and leaves your archive, settings and permissions as they
+are. Then quit and reopen Claude Desktop (⌘Q) so it loads the new version. (If you installed it with
+`git clone`, `cd ~/wacrawl-mcp && git pull` does the same.)
 
 ## Uninstall
 

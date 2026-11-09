@@ -62,8 +62,8 @@ The archive tools compare against WhatsApp live (`wacrawl doctor`, ~1 s) and war
 | File | What it does |
 |---|---|
 | `server.js` | the MCP server |
-| `install.sh` | end-to-end install, idempotent |
-| `setup-runtime.sh` | a dedicated copy of node in `runtime/` (not versioned) |
+| `install.sh` | end-to-end install, idempotent. Run on its own (`curl … \| bash`), it first gets the project into the folder of an existing install or `~/wacrawl-mcp` (git if the developer tools are there, a tarball otherwise) and hands over to the installer it got |
+| `setup-runtime.sh` | a dedicated copy of node in `runtime/` (not versioned): the user's if it's 18+, otherwise the official build, downloaded |
 | `install-sync-agent.sh` | renders the plist template and loads the launchd agent (`io.github.renzactus.wacrawl-mcp.sync`; it replaces the `com.openclaw.wacrawl.sync` agent earlier versions installed) |
 | `sync-wrapper.sh` | what launchd runs every 6 h: sync + self-recovery + alerts |
 | `register.sh` | adds the server to Claude Desktop's config |
@@ -113,7 +113,9 @@ Two defenses:
    Homebrew's node is ad-hoc signed, so every update changes its identity and macOS invalidates the
    permission. Homebrew's node isn't self-contained — it loads `libnode.*.dylib` through `@rpath` from
    `../lib`, which is copied too. `install.sh` doesn't rebuild the runtime if it already exists, so as not
-   to invalidate the permission.
+   to invalidate the permission. Without a node 18+ of their own, the user gets the official build of the
+   LTS line the server is tested with (26) from nodejs.org, checked against its `SHASUMS256.txt`. It's
+   self-contained, so the binary alone is enough (141 MB, against 67 MB for Homebrew's plus `libnode`).
 
 Sending also needs **Accessibility** for that same runtime (to press Enter), and **Automation → System Events**.
 
@@ -312,6 +314,31 @@ another candidate — before, looking up a contact by name came back as "matches
 extract it (Spotlight doesn't index WhatsApp's container, PyObjC isn't there), and rendering also works
 for scanned ones. Only the first page comes out.
 
+**Installer (`install.sh`)**
+
+- **`curl … | bash` reads the script from a pipe, a byte at a time, and runs it as it goes.** The part
+  that downloads lives in a function called on its last line, so a download cut off halfway runs nothing.
+  It hands over with `exec … </dev/null`, so nothing that runs later can read the rest of the pipe. Keep
+  the file well under 64 KB (the most a pipe holds): past that, the early `exec` leaves curl with nowhere
+  to write and it prints *"Failure writing output to destination"*.
+- **`set -e` + `pipefail` turn a failed look-up into a silent exit**, before anything is printed: a `sed`
+  over the sync agent's plist, which a new Mac doesn't have, ended the bootstrap without a word. Check
+  that the file exists first, or end the pipeline with `|| true`.
+- **Without the developer tools, `/usr/bin/git` doesn't fail: it offers to install them** (a big
+  download). The bootstrap only uses git if `xcode-select -p` succeeds; otherwise it downloads GitHub's
+  tarball of `master`. Run again, it updates in place: `git pull --ff-only`, or the tarball over the top
+  (bsdtar unlinks each file before writing it, so a script that's running keeps its old copy). Neither
+  touches `runtime/`, so its permissions survive.
+- **An existing install is updated where it is**: the bootstrap reads its folder from the sync agent's
+  plist. Otherwise a second install would appear in `~/wacrawl-mcp`, with a new runtime that needs the
+  permissions granted all over again.
+- **It only waits for Claude Desktop to quit from a terminal outside Claude.** Quitting Claude kills its
+  built-in terminal, Claude Code and everything they started, the installer included. It walks up the
+  parent processes looking for `Claude.app/Contents/MacOS/Claude` (case-sensitive: Claude Code's own
+  `claude.app` isn't Claude Desktop). It also needs a terminal (`[ -t 1 ]`): run by a tool, it explains
+  instead of waiting. If the server is already registered from the same files (an update), it doesn't
+  wait at all.
+
 ## Keeping private data out of the repo
 
 The repository is public, and it's developed against a real WhatsApp. `.githooks/pre-commit` blocks a
@@ -335,3 +362,11 @@ There's no test suite; `check.sh` covers rendering fidelity. To try things witho
 - `WACRAWL_QUEUE_POLL_MS` speeds up the queue's polling.
 - `WACRAWL_HISTORY_DIR=<dir>` points to another iPhone history.
 - `WACRAWL_TEST_CONFIG=<file>` makes `register.sh` write there and skip the check for Claude being open.
+- `WACRAWL_MCP_DIR=<dir>` picks the folder the one-liner installs into.
+- To try the one-liner without touching your install, give it a throwaway home:
+  `HOME=$(mktemp -d) bash < install.sh` downloads into it and stops at the requirements (there's no
+  WhatsApp data there). It downloads `master` from GitHub; for changes that aren't pushed yet, point
+  `src` in a copy of the script at a local `file://` folder holding a bare clone (`<folder>.git`) and
+  `archive/refs/heads/master.tar.gz` (`git archive --prefix=wacrawl-mcp-master/`).
+- `PATH=/usr/bin:/bin:/usr/sbin:/sbin ./setup-runtime.sh`, in a copy of the repo, tries the Node.js
+  download.

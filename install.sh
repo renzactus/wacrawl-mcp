@@ -1,19 +1,77 @@
 #!/bin/bash
 # End-to-end installer. Safe to run more than once: every step is skipped if it's
-# already done, so it also repairs an install.
+# already done, so it also repairs an install, and running it again is how you update.
 #
-#   ./install.sh
+#   curl -fsSL https://raw.githubusercontent.com/renzactus/wacrawl-mcp/master/install.sh | bash
+#   ./install.sh                     (from a clone: the same installer)
 #
-# Sets everything up except two things macOS won't let a script do: granting Full
-# Disk Access to the runtime and (if Claude is open) registering the server.
+# Run on its own, as in the first line, it first gets the project (with git if the
+# developer tools are there, as a tarball otherwise) into the folder of an existing
+# install, or ~/wacrawl-mcp (WACRAWL_MCP_DIR=<folder> picks another), and then runs the
+# installer it got.
+#
+# It sets everything up except what macOS won't let a script do: granting Full Disk
+# Access to the runtime and quitting Claude Desktop so the server can be registered. If
+# Claude is open, the installer waits for you to quit it, registers and opens it again.
 
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")" && pwd)"
-CONTAINER="$HOME/Library/Group Containers/group.net.whatsapp.WhatsApp.shared"
 ok()   { echo "  ✓ $*"; }
 fail() { echo "  ✗ $*"; exit 1; }
 step() { echo; echo "▸ $*"; }
+
+# Run on its own (curl … | bash): get the project, then hand over to the installer it
+# brings. A function, so that a download cut off halfway runs nothing at all.
+bootstrap() {
+  [ "$(uname -s)" = "Darwin" ] || fail "This only runs on macOS. On Windows/Linux, see wacli (README)."
+  local src="https://github.com/renzactus/wacrawl-mcp" dir="${WACRAWL_MCP_DIR:-}"
+  local agent="$HOME/Library/LaunchAgents/io.github.renzactus.wacrawl-mcp.sync.plist"
+  if [ -z "$dir" ] && [ -f "$agent" ]; then
+    # An existing install is updated where it is: its sync agent knows the folder.
+    dir="$(sed -n 's|.*<string>\(.*\)/sync-wrapper\.sh</string>.*|\1|p' "$agent" | head -1 || true)"
+    [ -f "$dir/install.sh" ] || dir=""
+  fi
+  dir="${dir:-$HOME/wacrawl-mcp}"
+
+  step "Getting wacrawl-mcp into $dir"
+  if [ -d "$dir/.git" ]; then
+    git -C "$dir" pull -q --ff-only </dev/null && ok "up to date" \
+      || echo "  ⚠ couldn't update it (local changes?): installing the version that's there"
+  elif [ -e "$dir" ] && [ ! -f "$dir/server.js" ] && [ -n "$(ls -A "$dir")" ]; then
+    fail "$dir already exists and isn't wacrawl-mcp. Move it, or pick another folder with WACRAWL_MCP_DIR (see the README)."
+  elif [ ! -f "$dir/server.js" ] && xcode-select -p >/dev/null 2>&1 && command -v git >/dev/null \
+       && git clone -q "$src.git" "$dir" </dev/null 2>/dev/null; then
+    ok "cloned"
+  else
+    # Without git: on a Mac without the developer tools, git only offers to install them
+    # (a big download). The tarball is the same code and needs just curl and tar.
+    mkdir -p "$dir"
+    curl -fsSL "$src/archive/refs/heads/master.tar.gz" | tar -xzf - -C "$dir" --strip-components 1 \
+      || fail "Couldn't download it. Check your connection and try again."
+    ok "downloaded"
+  fi
+  exec /bin/bash "$dir/install.sh" </dev/null
+}
+SELF="${BASH_SOURCE[0]:-}"
+[ -n "$SELF" ] && [ -f "$(dirname "$SELF")/server.js" ] || bootstrap
+
+REPO="$(cd "$(dirname "$SELF")" && pwd)"
+CONTAINER="$HOME/Library/Group Containers/group.net.whatsapp.WhatsApp.shared"
+CFG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+
+# pgrep doesn't work: macOS truncates the process name. Match the full command line.
+claude_open() { ps -ax -o args= | grep -F "Claude.app/Contents/MacOS/Claude" | grep -vF grep >/dev/null; }
+
+# Running inside Claude Desktop (its terminal, or Claude Code)? Then quitting Claude
+# would stop the installer too, so it can't wait for that.
+inside_claude() {
+  local pid=$$
+  while [ "${pid:-0}" -gt 1 ]; do
+    case "$(ps -o args= -p "$pid" 2>/dev/null)" in *"Claude.app/Contents/MacOS/Claude"*) return 0 ;; esac
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  done
+  return 1
+}
 
 step "Requirements"
 
@@ -29,11 +87,16 @@ ok "WhatsApp Desktop linked"
 [ -d /Applications/Claude.app ] || fail "Claude Desktop isn't installed (claude.ai/download)."
 ok "Claude Desktop"
 
+# The server runs on its own copy of node (see "Dedicated node runtime"): yours, copied,
+# or the official build if you don't have one.
 NODE="$(command -v node || true)"
-[ -n "$NODE" ] || fail "Node.js 18 or newer is missing: get it from nodejs.org (or 'brew install node')."
-NODE_MAJOR="$("$NODE" -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 18 ] || fail "Node $("$NODE" -v) is too old: it needs 18 or newer."
-ok "Node $("$NODE" -v)"
+if [ -x "$REPO/runtime/bin/node" ]; then
+  ok "Node $("$REPO/runtime/bin/node" -v) (this server's own copy)"
+elif [ -n "$NODE" ] && [ "$("$NODE" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -ge 18 ]; then
+  ok "Node $("$NODE" -v)"
+else
+  ok "Node.js isn't installed (or is older than 18): this server will get a copy of its own"
+fi
 
 step "wacrawl (builds the local archive)"
 
@@ -96,12 +159,29 @@ step "Automatic sync"
 "$REPO/install-sync-agent.sh" | sed -n '1s/^/  /p'
 
 step "Registering with Claude Desktop"
-if ps -ax -o args= | grep -F "Claude.app/Contents/MacOS/Claude" | grep -vF grep >/dev/null; then
-  echo "  ⚠ Claude Desktop is open, so it isn't registered yet (the entry would be erased when it quits)."
-  PENDING_REGISTER=1
-else
+
+# Already registered from this folder (an update, say)? Then there's nothing to redo.
+already_registered() {
+  "$REPO/runtime/bin/node" -e '
+    const fs = require("fs"), [cfg, ...want] = process.argv.slice(1);
+    const s = JSON.parse(fs.readFileSync(cfg, "utf8")).mcpServers.wacrawl;
+    const has = [s.command, s.args[0], s.env.WACRAWL_BIN];
+    process.exit(want.every((p, i) => fs.realpathSync(p) === fs.realpathSync(has[i])) ? 0 : 1);
+  ' "$CFG" "$REPO/runtime/bin/node" "$REPO/server.js" "$WACRAWL" 2>/dev/null
+}
+
+if already_registered; then
+  ok "already registered"
+  REGISTER=done
+elif ! claude_open; then
   "$REPO/register.sh" | sed -n '1s/^/  /p'
-  PENDING_REGISTER=0
+  REGISTER=done
+elif [ -t 1 ] && ! inside_claude; then
+  echo "  Claude Desktop is open: the installer registers the server when you quit it (see below)."
+  REGISTER=wait
+else
+  echo "  ⚠ Claude Desktop is open, so it isn't registered yet (the entry would be erased when it quits)."
+  REGISTER=manual
 fi
 
 echo
@@ -121,15 +201,26 @@ if [ "$NEW_RUNTIME" = 1 ]; then
   echo "    (it's already on your clipboard, and that screen is open)"
   echo
 fi
-if [ "$PENDING_REGISTER" = 1 ]; then
-  echo " 2. Quit Claude Desktop with ⌘Q (not just the window) and run:"
-  echo
-  echo "      $REPO/register.sh"
-  echo
-  echo " 3. Open Claude Desktop."
-else
-  echo " 2. Open Claude Desktop."
-fi
+case "$REGISTER" in
+  wait)
+    echo " 2. Then quit Claude Desktop with ⌘Q (closing the window isn't enough)."
+    echo "    The installer is waiting for that: it registers the server and opens Claude again."
+    ;;
+  manual)
+    echo " 2. Quit Claude Desktop with ⌘Q (not just the window) and run, in Terminal:"
+    echo
+    echo "      $REPO/register.sh"
+    echo
+    echo " 3. Open Claude Desktop."
+    ;;
+  *)
+    if claude_open; then
+      echo " 2. Quit Claude Desktop (⌘Q) and open it again, so it loads this version."
+    else
+      echo " 2. Open Claude Desktop."
+    fi
+    ;;
+esac
 echo
 echo " To try it, ask: \"what are my last 3 WhatsApp chats?\""
 echo " If something's off: $REPO/check.sh"
@@ -138,3 +229,16 @@ echo " Optional — transcribe voice notes on your Mac (they never leave it):"
 echo "   $REPO/setup-whisper.sh"
 echo " Optional — let Claude SEND messages, not just draft them (off by default):"
 echo "   $REPO/enable-sending.sh"
+
+if [ "$REGISTER" = wait ]; then
+  echo
+  echo "⏳ Waiting for Claude Desktop to quit (⌘Q)…"
+  echo "   (Ctrl-C stops waiting; then, with Claude quit, run $REPO/register.sh)"
+  while claude_open; do sleep 1; done
+  sleep 2   # it rewrites its config as it quits: let it finish first
+  if "$REPO/register.sh" | sed -n '1s/^/  /p'; then
+    open -a Claude 2>/dev/null && ok "Opening Claude Desktop. You're all set." || true
+  else
+    echo "  With Claude quit, run: $REPO/register.sh"
+  fi
+fi
