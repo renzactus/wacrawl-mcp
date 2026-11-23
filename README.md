@@ -61,7 +61,8 @@ flowchart LR
   searchable SQLite archive, refreshed by a background sync every 6 hours.
 - This server gives Claude tools over that archive, plus live reads of WhatsApp Desktop for whatever
   arrived in the last few hours.
-- Writing goes through the official app: a `whatsapp://` link opens the chat with the text typed in.
+- Writing goes through the official app: a `whatsapp://` link opens the chat with the text typed in
+  (groups open through their invite link, and the text is pasted).
   Direct sending (opt-in) presses Enter for you and checks WhatsApp's database to confirm the message
   went out.
 
@@ -198,6 +199,13 @@ Three levels, from the most to the least hands-on:
 - **Several:** *"write messages for these people and queue them up"*. The first one opens; **when it
   detects you sent it, it opens the next one** (~3 s). If you take your time with one, it waits. If you
   don't send one within 10 minutes, the queue pauses. You can say *skip*, *resume* or *cancel*.
+- **Groups:** WhatsApp only opens a group through its **invite link** (in the group: its name at the
+  top → *Invite via link* → copy). The first time you write to a group Claude asks you for it; give it
+  once and it stays saved on your Mac (`~/.wacrawl/group-links.json`, readable only by you — anyone with
+  that link can join the group). The link opens the chat but can't carry the text, so it's pasted with
+  ⌘V, replacing anything left unsent in that group's box: that needs the same Accessibility permission as
+  [direct sending](#direct-sending-optional-off-by-default).
+  Without it, the group opens with the text on your clipboard, ready for ⌘V.
 
 ### Direct sending (optional, off by default)
 
@@ -227,7 +235,11 @@ counters are saved on disk so restarting doesn't reset them:
 
 - at most 3 drafts per minute and 15 per hour, and at most 10 sends per hour
 - **never the same text to several people** (the broadcast pattern WhatsApp punishes)
-- one-to-one chats only: WhatsApp doesn't open groups this way
+- groups: **the first message to each group is always a draft**, so you see which group the link
+  opens; direct sending to a group only works once a message of yours has shown up in it after the
+  link opened. If a send to a group doesn't show up there, direct sending to it goes off until another
+  draft does. A link already saved for another group is refused, and so is a group you've left (its
+  link would offer to join it again)
 - a warning when it's a number you've never talked to
 - a send only presses Enter if WhatsApp is the frontmost app (otherwise the Enter would land in another
   app), and if it can't confirm the message went out it **doesn't retry**, so nothing goes out twice
@@ -343,7 +355,8 @@ stopped, and resumes where it left off:
 - **Voice notes are only transcribed if you install [local transcription](#voice-notes-optional)**;
   otherwise Claude knows they exist but not what they say.
 - **Drafting or sending needs the phone number.** It works with your saved contacts; for people you
-  haven't saved, WhatsApp hides the number and you have to give it.
+  haven't saved, WhatsApp hides the number and you have to give it. Groups need their invite link
+  once (see [Drafts](#drafts)); WhatsApp doesn't keep it on the Mac, so Claude can't find it alone.
 - If someone is saved under a nickname, look them up the way you saved them.
 
 ## Troubleshooting

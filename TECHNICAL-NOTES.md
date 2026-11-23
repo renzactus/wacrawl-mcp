@@ -50,7 +50,7 @@ transparent: `countDistinct`, `selectMessages` and `queryChats` run the query on
 | `recent_messages` | live | what arrived seconds ago |
 | `view_attachments` | archive + live | returns images and PDFs as MCP images, Word documents as text |
 | `export_attachments` | archive + live | copies an attachment to a normal folder |
-| `draft_message` | opens WhatsApp | one unsent draft |
+| `draft_message` | opens WhatsApp | one unsent draft (groups: through their invite link) |
 | `draft_queue` | opens WhatsApp + live | several drafts, one at a time, as they get sent |
 | `send_message` | opens WhatsApp + live | sends for real and verifies it (opt-in) |
 | `transcribe_audio` | archive + local Whisper | transcribes, on the spot, voice notes that have no text yet |
@@ -86,7 +86,8 @@ hold data were kept so existing installs keep working:
 | `wacrawl.db`, `media/` | wacrawl's archive and its copied attachments |
 | `historico/` | the iPhone history: `wacrawl.db`, `corte.json` (the cutoff; keys `corte`, `desde`, `sinVideos`, `adjuntosDesde`…), `chats.json` (a cache) and `fuente/` (the files taken out of the backup — the history's media paths point there) |
 | `transcripciones.sqlite` | transcriptions: table `transcripciones` with `texto` (text), `duracion` (duration), `modelo` (model + vocabulary fingerprint), `creado` (created at) |
-| `borradores.jsonl` | the draft and send log, which the safeguards count |
+| `borradores.jsonl` | the draft and send log, which the safeguards count (`phone`, or `group` with the JID) |
+| `group-links.json` | groups' invite codes, by JID: `code`, `name`, `openedAt`, `confirmedAt` (mode 600: the code lets anyone join) |
 | `limits.json` | user-adjustable limits (the older `limites.json`, with Spanish keys, is still read) |
 | `vocabulary.txt` | the transcription vocabulary (`vocabulario.txt` is still read) |
 | `whisper.env` | per-user transcription settings, e.g. `WHISPER_LANGUAGE` |
@@ -213,6 +214,32 @@ Sending also needs **Accessibility** for that same runtime (to press Enter), and
 
 - `whatsapp://send?phone=…&text=…` opens the chat with the text in the box, without sending. It needs a
   phone number: it doesn't work for groups or for `@lid`s of people who aren't in your contacts.
+- **Groups open through their invite link**: `whatsapp://chat/?code=<code>` (the code from
+  `https://chat.whatsapp.com/<code>`; trailing parameters like `?mode=…` don't matter). For a group you're
+  in, it lands on the chat (`WACRAWL_GROUP_OPEN_MS`, 2.5 s, is the wait before pasting). It takes no
+  `text`, so the text goes through the clipboard and ⌘A ⌘V via System Events (same Accessibility
+  permission as sending); the previous clipboard is put back if it was text. The ⌘A makes it replace
+  what's in the box, as `whatsapp://send` does: otherwise "now send it" after a draft would send the
+  text twice, glued together. If the paste is refused, a draft still opens the group and leaves the text
+  on the clipboard; a send stops before the Enter.
+- **No invite codes were found on the Mac**: no table or column in `ChatStorage.sqlite` or the other
+  databases in the container is named after them (their contents weren't searched), and only admins see
+  the link unless the group allows everyone. So the person gives it once and it goes to
+  `~/.wacrawl/group-links.json` (mode 600). Links found in messages aren't used: nothing says which group
+  they belong to.
+- **A link is only trusted for sending once confirmed**: after a group draft opens, the server watches
+  the live database for up to `queueWaitMin` minutes; a message of yours in THAT group's chat
+  (`ZCONTACTJID` = the group's JID) is taken as proof that the link opens it. A wrong link would land in
+  another group, where the message wouldn't count. It's a heuristic: a message you send to that group by
+  hand in that window (from the phone, say) counts too. A new link for the group resets the
+  confirmation; the same code for two groups is refused.
+- **Sending to a group presses Enter once**, not twice as in one-to-one chats: if an admin reset the
+  link, the first Enter may only close a notice, and the second would land on whatever chat was open
+  behind it. If the message doesn't show up in the group, the confirmation is dropped (and `openedAt`
+  with it, so that attempt can't confirm it later).
+- **Membership**: `ZWAGROUPINFO.ZSTATE` is 0 for groups you're in; the ones you left or were removed
+  from seem to be those with other values (5, 6 seen): their last message is a group event. Opening the
+  link of a group you're not in offers to join it, and an Enter there would accept — so those are refused.
 - **WhatsApp doesn't keep a draft if another chat is opened.** That's why the queue opens the next one
   only when it detects a message of yours in that chat (polling the live database every 2.5 s, ~40 ms
   per query), and not on a timer.
@@ -295,13 +322,13 @@ Sending also needs **Accessibility** for that same runtime (to press Enter), and
 
 **Sending (`send_message`)**
 
-- The same path as a draft (`whatsapp://send`) + Enter via AppleScript (`key code 36` to System Events)
+- The same path as a draft (`whatsapp://send`, or a group's link and the paste) + Enter via AppleScript (`key code 36` to System Events)
   + verification against the live database with `detectSent`. Official app: no unofficial-client risk.
   It's opt-in with `allowSending` in `limits.json`, which the person turns on; it's a separate tool from
   `draft_message` so that Claude Desktop's per-call permission is a human confirmation.
 - Before the Enter it checks that WhatsApp is the frontmost app: if focus moved, the Enter would land in
-  another window. A second Enter, if the send wasn't detected, is safe: if the first one sent it, the box
-  is empty.
+  another window. In a one-to-one chat, a second Enter if the send wasn't detected is safe: if the first
+  one sent it, the box is empty. Groups get only one (see Drafts).
 - If it isn't confirmed, it **doesn't retry**, and the model is told not to retry: it may have gone out anyway.
 - Permissions: Accessibility for the runtime (the keystroke, error 1002) and Automation → System Events
   (error -1743). Each error is translated into the exact instruction.
@@ -354,11 +381,15 @@ There's no test suite; `check.sh` covers rendering fidelity. To try things witho
 
 - `WACRAWL_OPEN_BIN=<script>` replaces the `open` that launches WhatsApp.
 - `WACRAWL_ENTER_BIN=<script>` replaces the AppleScript that presses Enter.
-- `WACRAWL_DRAFTS_DIR=<dir>` isolates the draft log, `STOP`, `limits.json`, `whisper.env` and the
-  transcriptions database.
-- `WACRAWL_FAKE_SENT_FILE=<file>` fakes sends for the queue and `send_message` (one phone number per
-  line). Careful: it skips the real query to the database — that's how the `ZCONTACTIDENTIFIER` bug
-  slipped through; test the real detection separately.
+- `WACRAWL_PASTE_BIN=<script>` replaces the clipboard + ⌘V for groups (it gets the text as its argument;
+  the real clipboard isn't touched). `WACRAWL_GROUP_OPEN_MS` shortens the wait after opening a group.
+- `WACRAWL_DRAFTS_DIR=<dir>` isolates the draft log, `STOP`, `limits.json`, `group-links.json`,
+  `whisper.env` and the transcriptions database.
+- `WACRAWL_FAKE_SENT_FILE=<file>` fakes sends for the queue, `send_message` and group-link confirmation
+  (one phone number or group JID per line). Careful: it skips the real query to the database — that's
+  how the `ZCONTACTIDENTIFIER` bug slipped through; test the real detection separately.
+- Group tests need real group JIDs (the membership check reads WhatsApp live): pick them with a query
+  in the test script and redact them from its output. Invite codes in tests are made up.
 - `WACRAWL_QUEUE_POLL_MS` speeds up the queue's polling.
 - `WACRAWL_HISTORY_DIR=<dir>` points to another iPhone history.
 - `WACRAWL_TEST_CONFIG=<file>` makes `register.sh` write there and skip the check for Claude being open.

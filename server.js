@@ -338,6 +338,10 @@ const DRAFTS_DIR = process.env.WACRAWL_DRAFTS_DIR || path.join(os.homedir(), '.w
 const OPEN_BIN = process.env.WACRAWL_OPEN_BIN || '/usr/bin/open';
 // "borradores" means drafts: the name predates the English version and is kept for existing installs.
 const DRAFTS_LOG = path.join(DRAFTS_DIR, 'borradores.jsonl');
+// Groups have no phone number: WhatsApp only opens them through their invite link. The person
+// gives it once per group and it's kept here, on this Mac only (it's a secret: anyone holding it
+// can join the group).
+const GROUP_LINKS = path.join(DRAFTS_DIR, 'group-links.json');
 const KILL_SWITCH = path.join(DRAFTS_DIR, 'STOP');
 const DEFAULT_LIMITS = {
   perMinute: 3,           // single drafts (draft_message) and sends
@@ -384,15 +388,19 @@ function readDraftLog() {
   }
 }
 
-// Entries written by the original Spanish version use telefono / texto / envio.
-const entryPhone = (d) => d.phone ?? d.telefono;
+// Entries written by the original Spanish version use telefono / texto / envio. Group drafts
+// carry the group's JID instead of a phone number.
+const entryKey = (d) => d.phone ?? d.telefono ?? d.group;
 const entryText = (d) => d.text ?? d.texto;
 const entryIsSend = (d) => Boolean(d.send ?? d.envio);
 
 const normalizeText = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').trim();
 
-/** Returns why it's blocked, or null if the draft can be opened. mode: 'draft' | 'queue' | 'send'. */
-function checkSafeguards(phone, text, { mode = 'draft' } = {}) {
+/**
+ * Returns why it's blocked, or null if the draft can be opened. `key` identifies the recipient:
+ * the phone number, or the JID for a group. mode: 'draft' | 'queue' | 'send'.
+ */
+function checkSafeguards(key, text, { mode = 'draft' } = {}) {
   LIMITS = loadLimits();
   if (fs.existsSync(KILL_SWITCH)) {
     return `Drafts are DISABLED: ${KILL_SWITCH} exists. Delete that file to turn them back on.`;
@@ -414,7 +422,7 @@ function checkSafeguards(phone, text, { mode = 'draft' } = {}) {
   // broadcasts are what get WhatsApp accounts banned.
   const t = normalizeText(text);
   const repeated = LIMITS.antiBroadcast &&
-    inWindow(LIMITS.broadcastWindowMin).find((d) => entryText(d) === t && entryPhone(d) !== phone);
+    inWindow(LIMITS.broadcastWindowMin).find((d) => entryText(d) === t && entryKey(d) !== key);
   if (repeated) {
     return `Blocked: that same text was already drafted for another chat (${repeated.chat}) in the last hour. No broadcasts.`;
   }
@@ -426,32 +434,158 @@ function logDraft(entry) {
   fs.appendFileSync(DRAFTS_LOG, JSON.stringify(entry) + '\n');
 }
 
-/** The phone number (digits only) for a chat, or an error explaining why there isn't one. */
-async function recipientFor(chat) {
+/* --- groups: opened through their invite link ----------------------- */
+
+function readGroupLinks() {
+  try { return JSON.parse(fs.readFileSync(GROUP_LINKS, 'utf8')) || {}; } catch { return {}; }
+}
+
+function writeGroupLinks(links) {
+  fs.mkdirSync(DRAFTS_DIR, { recursive: true });
+  fs.writeFileSync(GROUP_LINKS, JSON.stringify(links, null, 2) + '\n', { mode: 0o600 });
+}
+
+/** The code in https://chat.whatsapp.com/<code> (whatever follows it, like ?mode=…, is dropped). */
+function inviteCode(link) {
+  const m = String(link).trim().match(/^(?:https?:\/\/)?chat\.whatsapp\.com\/(?:invite\/)?([A-Za-z0-9]{10,40})(?:[/?#].*)?$/i);
+  if (!m) {
+    throw new Error(`"${String(link).slice(0, 80)}" isn't a group invite link: it should look like https://chat.whatsapp.com/<code>.`);
+  }
+  return m[1];
+}
+
+const GROUP_LINK_HOWTO =
+  'Ask the user for the group\'s invite link (in WhatsApp: the group → its name at the top → "Invite via link" → copy; ' +
+  'if they aren\'t an admin, an admin can send it to them) and pass it as group_link. ' +
+  'It\'s kept on this Mac, so it\'s needed only once per group.';
+
+const GROUP_LINK_PARAM =
+  "Only for groups, and only the first time (or if the group's link changed): the group's invite link, " +
+  'https://chat.whatsapp.com/<code>, exactly as the user gave it. Never one taken from another group or guessed.';
+
+/**
+ * Am I still in the group? Opening the link of a group you left offers to JOIN it again, and
+ * an Enter there would accept. ZWAGROUPINFO.ZSTATE is 0 while you're in it; the groups you
+ * left or were removed from have other values and end in a group event.
+ * Returns 'member' | 'left' | 'unknown' (couldn't read WhatsApp live).
+ */
+async function groupMembership(jid) {
+  try {
+    const [row] = await runLiveSQL(
+      `SELECT g.ZSTATE AS state FROM ZWACHATSESSION s LEFT JOIN ZWAGROUPINFO g ON g.ZCHATSESSION = s.Z_PK` +
+      ` WHERE s.ZCONTACTJID = ${sqlString(jid)} LIMIT 1`
+    );
+    if (!row) return 'left';
+    return row.state === 0 || row.state === null ? 'member' : 'left';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * A link is CONFIRMED once a message of mine shows up in that group's chat shortly after the
+ * link was opened: proof that the link opens this group and not another one. Until then,
+ * send_message refuses it — the person sees which group opens with draft_message first.
+ */
+async function confirmGroupLink(jid) {
+  const links = readGroupLinks();
+  const entry = links[jid];
+  if (!entry || entry.confirmedAt) return Boolean(entry?.confirmedAt);
+  if (!entry.openedAt) return false;
+  const until = entry.openedAt + loadLimits().queueWaitMin * 60000;
+  let sent = false;
+  try { sent = await detectSent({ jid }, entry.openedAt, until); } catch { return false; }
+  if (!sent) return false;
+  const fresh = readGroupLinks();
+  if (fresh[jid]?.code === entry.code) {
+    fresh[jid].confirmedAt = Date.now();
+    writeGroupLinks(fresh);
+  }
+  return true;
+}
+
+/**
+ * A direct send never showed up in the group: the link may not open it anymore (an admin can
+ * reset it). `openedAt` goes too, so this attempt can't confirm the link later: the next message
+ * has to be a draft again.
+ */
+function unconfirmGroupLink(jid) {
+  const links = readGroupLinks();
+  if (!links[jid]) return;
+  delete links[jid].confirmedAt;
+  delete links[jid].openedAt;
+  writeGroupLinks(links);
+}
+
+/** Watches a freshly opened group draft for a while, to confirm its link when the person sends it. */
+function watchGroupLink(jid) {
+  const started = Date.now();
+  const timer = setInterval(async () => {
+    if (Date.now() - started > loadLimits().queueWaitMin * 60000 || (await confirmGroupLink(jid))) clearInterval(timer);
+  }, POLL_MS);
+  timer.unref?.();
+}
+
+async function groupRecipient(jid, name, groupLink, { mode }) {
+  const links = readGroupLinks();
+  let code = links[jid]?.code;
+  if (groupLink) {
+    code = inviteCode(groupLink);
+    const other = Object.entries(links).find(([j, e]) => j !== jid && e.code === code);
+    if (other) {
+      throw new Error(`That invite link is already saved for another group ("${other[1].name}"). Check it's the link of "${name}".`);
+    }
+  }
+  if (!code) throw new Error(`"${name}" is a group, and WhatsApp only opens a group through its invite link. ${GROUP_LINK_HOWTO}`);
+
+  const membership = await groupMembership(jid);
+  if (membership === 'left') {
+    throw new Error(`You're no longer in "${name}": opening its link would offer to join it again. Nothing was opened.`);
+  }
+  if (mode === 'send') {
+    if (membership === 'unknown') {
+      throw new Error(`Couldn't check in WhatsApp that you're still in "${name}", so I won't send to it. Use draft_message.`);
+    }
+    const sameLink = links[jid]?.code === code;
+    if (!sameLink || !(await confirmGroupLink(jid))) {
+      throw new Error(
+        `The link for "${name}" isn't confirmed yet. Leave this first message with draft_message: the user sees which group ` +
+        'it opens and sends it; once it shows up in that group, send_message works for it.'
+      );
+    }
+  }
+  return { kind: 'group', key: jid, jid, code, name, known: true };
+}
+
+/**
+ * Who a message goes to: a phone number (digits only) for a one-to-one chat, or a group with
+ * its invite code; or an error explaining why it can't be opened.
+ * mode: 'draft' | 'queue' | 'send' (sending to a group needs a confirmed link).
+ */
+async function recipientFor(chat, { groupLink, mode = 'draft' } = {}) {
   const value = String(chat).trim();
 
   // A number typed directly
   const digits = value.replace(/[\s\-().]/g, '').replace(/^\+/, '');
   if (/^\d{8,15}$/.test(digits)) {
     const [prev] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(`${digits}@s.whatsapp.net`)} LIMIT 1`);
-    return { phone: digits, jid: `${digits}@s.whatsapp.net`, name: prev?.name || `+${digits}`, known: Boolean(prev) };
+    return { key: digits, phone: digits, jid: `${digits}@s.whatsapp.net`, name: prev?.name || `+${digits}`, known: Boolean(prev) };
   }
 
   const jid = await resolveChatJID(value);
   const [row] = await runSQL(`SELECT name FROM chats WHERE jid = ${sqlString(jid)} LIMIT 1`);
   const name = row?.name || value;
 
-  if (jid.endsWith('@g.us')) {
-    throw new Error(`"${name}" is a group. WhatsApp only opens one-to-one chats through a link: open the group by hand.`);
-  }
+  if (jid.endsWith('@g.us')) return groupRecipient(jid, name, groupLink, { mode });
   if (jid.endsWith('@s.whatsapp.net')) {
-    return { phone: jid.split('@')[0], jid, name, known: true };
+    const phone = jid.split('@')[0];
+    return { key: phone, phone, jid, name, known: true };
   }
   if (jid.endsWith('@lid')) {
     const [ct] = await runSQL(
       `SELECT jid FROM contacts WHERE lid = ${sqlString(jid)} AND deleted_at IS NULL AND jid LIKE '%@s.whatsapp.net' LIMIT 1`
     );
-    if (ct) return { phone: ct.jid.split('@')[0], jid, name, known: true };
+    if (ct) { const phone = ct.jid.split('@')[0]; return { key: phone, phone, jid, name, known: true }; }
     throw new Error(
       `I don't have the number for "${name}": they're not in your contacts, and WhatsApp hides the number of people you haven't saved. ` +
       `If you know it, give it to me directly.`
@@ -478,43 +612,127 @@ tell application "System Events"
   key code 36
 end tell`;
 
-function pressEnter() {
+/**
+ * Runs a keystroke AppleScript (or its test stand-in) and turns macOS's refusals into the exact
+ * instruction. `what` says what the keystroke was for; `state` what's left on screen if it fails.
+ */
+function runKeystroke(script, fakeBin, fakeArgs, { prefix, what, state }) {
   return new Promise((resolve, reject) => {
-    const [bin, args] = ENTER_BIN ? [ENTER_BIN, []] : ['/usr/bin/osascript', ['-e', ENTER_SCRIPT]];
+    const [bin, args] = fakeBin ? [fakeBin, fakeArgs] : ['/usr/bin/osascript', ['-e', script]];
     execFile(bin, args, { timeout: 15000 }, (err, _out, stderr) => {
       if (!err) return resolve();
       const msg = String(stderr || err.message);
       if (/frontmost:/.test(msg)) {
         const app = msg.split('frontmost:')[1].split('(')[0].trim();
-        reject(new Error(`Not sent: WhatsApp didn't stay in front (${app} was), and the Enter would have landed there. The message is typed in WhatsApp, unsent.`));
+        reject(new Error(`${prefix}: WhatsApp didn't stay in front (${app} was), and the keystroke would have landed there. ${state}`));
       } else if (/1002|not allowed to send keystrokes|assistive/i.test(msg)) {
         reject(new Error(
-          "Not sent: macOS doesn't give this server the Accessibility permission it needs to press Enter. " +
+          `${prefix}: macOS doesn't give this server the Accessibility permission it needs to ${what}. ` +
           'The user has to go to System Settings → Privacy & Security → Accessibility → + → ⌘⇧G → ' +
-          `${process.execPath} → turn it on. The message is typed in WhatsApp, unsent.`
+          `${process.execPath} → turn it on. ${state}`
         ));
       } else if (/-1743|not authorized to send apple events|no autorizado/i.test(msg)) {   // macOS errors can be localized
         reject(new Error(
-          'Not sent: macOS doesn\'t allow this server to control "System Events". The user has to go to ' +
-          'System Settings → Privacy & Security → Automation and turn on System Events for node. ' +
-          'The message is typed in WhatsApp, unsent.'
+          `${prefix}: macOS doesn't allow this server to control "System Events". The user has to go to ` +
+          `System Settings → Privacy & Security → Automation and turn on System Events for node. ${state}`
         ));
       } else {
-        reject(new Error(`Not sent: ${msg.trim().slice(0, 200)}. The message is typed in WhatsApp, unsent.`));
+        reject(new Error(`${prefix}: ${msg.trim().slice(0, 200)}. ${state}`));
       }
     });
   });
 }
 
-/** Opens WhatsApp on the chat with the text typed in. Doesn't send. */
-async function openDraft({ phone, name }, body, extra = {}) {
-  const url = `whatsapp://send?phone=${phone}&text=${encodeURIComponent(body)}`;
-  await new Promise((resolve, reject) => {
+function pressEnter() {
+  return runKeystroke(ENTER_SCRIPT, ENTER_BIN, [], {
+    prefix: 'Not sent', what: 'press Enter', state: 'The message is typed in WhatsApp, unsent.',
+  });
+}
+
+/**
+ * Groups: the invite link opens the chat but, unlike whatsapp://send, it can't carry the text.
+ * So the text goes through the clipboard and ⌘V — which needs the same Accessibility permission
+ * as sending. The person's clipboard is put back afterwards (if it held text).
+ * ⌘A first, so the text REPLACES whatever is in the box, as whatsapp://send does: pasting after
+ * an unsent draft ("now send it") would send both texts glued together. Drafts and sends use the
+ * same keystrokes on purpose: the draft that confirms a link also shows that they work.
+ */
+const PASTE_BIN = process.env.WACRAWL_PASTE_BIN || null;   // tests only: gets the text as its argument
+
+const PASTE_SCRIPT = `
+tell application "WhatsApp" to activate
+delay 0.4
+tell application "System Events"
+  set frontApp to name of first application process whose frontmost is true
+  if frontApp is not "WhatsApp" then error "frontmost:" & frontApp
+  keystroke "a" using command down
+  delay 0.2
+  keystroke "v" using command down
+end tell`;
+
+function clipboard(text) {
+  return new Promise((resolve, reject) => {
+    if (text === undefined) {
+      execFile('/usr/bin/pbpaste', [], { timeout: 5000 }, (err, out) => resolve(err ? '' : out));
+      return;
+    }
+    const p = spawn('/usr/bin/pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] });
+    p.on('error', reject);
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`pbcopy exited with ${code}`))));
+    p.stdin.end(text);
+  });
+}
+
+async function pasteText(body) {
+  const state = 'The group is open in WhatsApp and the text is on the clipboard: the user can paste it with ⌘V.';
+  if (PASTE_BIN) return runKeystroke('', PASTE_BIN, [body], { prefix: 'Not typed', what: 'paste the text', state });
+  const previous = await clipboard();
+  await clipboard(body);
+  await runKeystroke(PASTE_SCRIPT, null, [], { prefix: 'Not typed', what: 'paste the text', state });
+  await sleep(600);   // WhatsApp reads the clipboard asynchronously
+  if (previous) await clipboard(previous).catch(() => {});
+}
+
+const GROUP_OPEN_MS = Number(process.env.WACRAWL_GROUP_OPEN_MS) || 2500;   // the invite link takes a moment to land on the chat
+
+function openURL(url) {
+  return new Promise((resolve, reject) => {
     execFile(OPEN_BIN, [url], { timeout: 15000 }, (err, _out, stderr) =>
       err ? reject(new Error(`Couldn't open WhatsApp: ${(stderr || err.message).toString().trim()}`)) : resolve()
     );
   });
-  logDraft({ ts: Date.now(), phone, chat: name, text: normalizeText(body), ...extra });
+}
+
+/**
+ * Opens WhatsApp on the chat with the text typed in. Doesn't send.
+ * For a group, `pasteFailure` comes back set if the chat opened but the text couldn't be pasted
+ * (it's on the clipboard then). With `strict` (sending), that failure throws instead.
+ */
+async function openDraft(recipient, body, extra = {}, { strict = false } = {}) {
+  const { phone, name } = recipient;
+  if (recipient.kind !== 'group') {
+    await openURL(`whatsapp://send?phone=${phone}&text=${encodeURIComponent(body)}`);
+    logDraft({ ts: Date.now(), phone, chat: name, text: normalizeText(body), ...extra });
+    return {};
+  }
+
+  const { jid, code } = recipient;
+  const links = readGroupLinks();
+  const openedAt = Date.now();
+  const sameLink = links[jid]?.code === code;
+  links[jid] = { ...(sameLink ? links[jid] : { savedAt: openedAt }), code, name, openedAt };
+  writeGroupLinks(links);
+
+  await openURL(`whatsapp://chat/?code=${code}`);
+  logDraft({ ts: openedAt, group: jid, chat: name, text: normalizeText(body), ...extra });
+  await sleep(GROUP_OPEN_MS);
+  try {
+    await pasteText(body);
+  } catch (err) {
+    if (strict) throw err;
+    return { pasteFailure: err.message };
+  }
+  return {};
 }
 
 function notify(text) {
@@ -528,18 +746,19 @@ function notify(text) {
  * ZCONTACTJID = <something>@lid, and the phone number goes in ZCONTACTIDENTIFIER. Looking only
  * at ZCONTACTJID never found it, and the queue waited forever.
  */
-async function detectSent({ jid, phone }, sinceMs) {
-  if (process.env.WACRAWL_FAKE_SENT_FILE) {   // tests only
-    try { return fs.readFileSync(process.env.WACRAWL_FAKE_SENT_FILE, 'utf8').split('\n').includes(phone); }
+async function detectSent({ jid, phone }, sinceMs, untilMs) {
+  if (process.env.WACRAWL_FAKE_SENT_FILE) {   // tests only: one phone number (or group JID) per line
+    try { return fs.readFileSync(process.env.WACRAWL_FAKE_SENT_FILE, 'utf8').split('\n').includes(phone || jid); }
     catch { return false; }
   }
-  const jids = [...new Set([jid, `${phone}@s.whatsapp.net`].filter(Boolean))];
+  const jids = [...new Set([jid, phone && `${phone}@s.whatsapp.net`].filter(Boolean))];
   const list = jids.map(sqlString).join(', ');
   const since = Math.floor(sinceMs / 1000) - APPLE_EPOCH - 5;
+  const until = untilMs ? ` AND m.ZMESSAGEDATE <= ${Math.floor(untilMs / 1000) - APPLE_EPOCH}` : '';
   const [row] = await runLiveSQL(
     `SELECT count(*) AS n FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION` +
     ` WHERE (s.ZCONTACTJID IN (${list}) OR s.ZCONTACTIDENTIFIER IN (${list}))` +
-    ` AND m.ZISFROMME = 1 AND m.ZMESSAGEDATE >= ${since}`
+    ` AND m.ZISFROMME = 1 AND m.ZMESSAGEDATE >= ${since}${until}`
   );
   return (row?.n ?? 0) > 0;
 }
@@ -576,7 +795,7 @@ async function openNext() {
     return;
   }
   const item = draftQueue.items[i];
-  const blocked = checkSafeguards(item.phone, item.text, { mode: 'queue' });
+  const blocked = checkSafeguards(item.key, item.text, { mode: 'queue' });
   if (blocked) {
     draftQueue.status = 'paused';
     draftQueue.reason = blocked;
@@ -584,9 +803,11 @@ async function openNext() {
     return;
   }
   try {
-    await openDraft(item, item.text, { queue: true });
+    const openedAt = Date.now();
+    const { pasteFailure } = await openDraft(item, item.text, { queue: true });
     item.status = 'open';
-    item.openedAt = Date.now();
+    item.openedAt = openedAt;
+    if (pasteFailure) notify(`"${item.name}" is open: paste the text with ⌘V.`);
   } catch (err) {
     item.status = 'error';
     item.reason = err.message;
@@ -608,6 +829,7 @@ async function watchQueue() {
     if (!item) return;
     if (await detectSent(item, item.openedAt)) {
       item.status = 'sent';
+      if (item.kind === 'group') await confirmGroupLink(item.jid);
       // short pause so WhatsApp finishes sending before switching chats
       await sleep(1500);
       await openNext();
@@ -1214,7 +1436,7 @@ SEARCH: use search_messages first (full-text index, whole words). If it returns 
 
 ATTACHMENTS: images, PDFs and Word documents can be LOOKED AT/READ with view_attachments and COPIED to a normal folder with export_attachments. These two tools also look at WhatsApp LIVE: attachments do NOT have the archive's 6-hour lag — never use the lag to explain a missing attachment. If a tool says an attachment was NOT downloaded, tell the user exactly that: they have to open the chat in WhatsApp Desktop and click the file (large files don't download on their own); waiting won't fix it. __FILES__ VOICE NOTES: if local transcription is installed, voice notes appear as (audio) «text» and also show up in searches (section "In voice notes"). It's automatic transcription with Whisper: the gist is reliable, but proper names and foreign words can come out wrong — don't quote them as exact. When searching voice notes for a NAME and there are few results, also try how it might come out misspelled (e.g. a company name like "Viatik" can come out as "viatic"): transcription fails precisely on unusual names. If a voice note shows as "(audio)" with no text, it hasn't been transcribed yet: use transcribe_audio. "(audio, no speech detected)" is silence or noise.
 
-WRITING: send_message really SENDS (if the user turned it on on this Mac). Use it only when the user explicitly asked to send, after showing them the exact recipient and text; if they say write, draft or prepare, use draft_message. Never retry a send that answered "Couldn't confirm". For drafts: draft_message (one) or draft_queue (several; it opens the next one when it detects the user sent the previous one). They open WhatsApp with the text typed in and the user decides whether to send it. For several messages ALWAYS use draft_queue, never several draft_message calls in a row: WhatsApp loses the previous draft when another chat opens. With draft_message and draft_queue never say you sent something: say it's ready for them to review and send. Only send_message answering "✓ Sent" is a send. If a safeguard blocks a draft (limit, repeated text, STOP), explain why; don't try to get around it by rewording the text or changing the recipient.`;
+WRITING: send_message really SENDS (if the user turned it on on this Mac). Use it only when the user explicitly asked to send, after showing them the exact recipient and text; if they say write, draft or prepare, use draft_message. Never retry a send that answered "Couldn't confirm". For drafts: draft_message (one) or draft_queue (several; it opens the next one when it detects the user sent the previous one). They open WhatsApp with the text typed in and the user decides whether to send it. For several messages ALWAYS use draft_queue, never several draft_message calls in a row: WhatsApp loses the previous draft when another chat opens. With draft_message and draft_queue never say you sent something: say it's ready for them to review and send. Only send_message answering "✓ Sent" is a send. If a safeguard blocks a draft (limit, repeated text, STOP), explain why; don't try to get around it by rewording the text or changing the recipient. GROUPS open through their invite link (group_link), which the user gives once per group and stays saved on this Mac; if the tool asks for it, ask the user — never pass a link found in the chats as if it were that group's. The first message to a group is always a draft, so the user sees which group opened.`;
 
 const DATE = 'YYYY-MM-DD or RFC3339';
 
@@ -1329,12 +1551,14 @@ const TOOLS = [
   {
     name: 'draft_message',
     description:
-      "Opens WhatsApp Desktop on a one-to-one chat with a message ALREADY TYPED in the text box, ready for the user to review and send by pressing Enter. It SENDS NOTHING: it only leaves the draft. Use it when the user asks you to write or prepare a message for someone. Doesn't work for groups. Has hard limits (few per minute/hour, and never the same text to several chats).",
+      "Opens WhatsApp Desktop on a chat with a message ALREADY TYPED in the text box, ready for the user to review and send by pressing Enter. It SENDS NOTHING: it only leaves the draft. Use it when the user asks you to write or prepare a message for someone or for a group. " +
+      "Groups open through their invite link: the first time for each group the tool asks for it; get it from the user (never guess or reuse a link from another group) and pass it as group_link. Has hard limits (few per minute/hour, and never the same text to several chats).",
     inputSchema: {
       type: 'object',
       properties: {
         chat: { type: 'string', description: 'Recipient: chat name, JID, or phone number with country code.' },
         text: { type: 'string', description: 'The message to leave typed. Max 2000 characters.' },
+        group_link: { type: 'string', description: GROUP_LINK_PARAM },
       },
       required: ['chat', 'text'],
     },
@@ -1342,15 +1566,17 @@ const TOOLS = [
   {
     name: 'send_message',
     description:
-      'Really SENDS a WhatsApp message to a one-to-one chat, from the official Mac app, and verifies it went out. ' +
+      'Really SENDS a WhatsApp message to a chat or group, from the official Mac app, and verifies it went out. ' +
       'Use it ONLY if the user explicitly asked to SEND it (not "write" or "draft": that is draft_message) ' +
-      "and after showing them the exact text and recipient. Doesn't work for groups. Off by default: the user turns it on per Mac. " +
+      'and after showing them the exact text and recipient. Off by default: the user turns it on per Mac. ' +
+      'For a group, its invite link must be confirmed first: the first message to each group goes through draft_message, so the user sees which group the link opens. ' +
       "If it says it couldn't confirm the send, do NOT call it again with the same message: it may have gone out anyway; ask the user to check WhatsApp.",
     inputSchema: {
       type: 'object',
       properties: {
         chat: { type: 'string', description: 'Recipient: chat name, JID, or phone number with country code.' },
         text: { type: 'string', description: 'The exact message to send. Max 2000 characters.' },
+        group_link: { type: 'string', description: GROUP_LINK_PARAM },
       },
       required: ['chat', 'text'],
     },
@@ -1365,10 +1591,10 @@ const TOOLS = [
         action: { type: 'string', enum: ['create', 'status', 'skip', 'resume', 'cancel'] },
         messages: {
           type: 'array',
-          description: 'Only for create: a list of {chat, text}, in the order they will open.',
+          description: 'Only for create: a list of {chat, text, group_link?}, in the order they will open.',
           items: {
             type: 'object',
-            properties: { chat: { type: 'string' }, text: { type: 'string' } },
+            properties: { chat: { type: 'string' }, text: { type: 'string' }, group_link: { type: 'string', description: GROUP_LINK_PARAM } },
             required: ['chat', 'text'],
           },
         },
@@ -1695,7 +1921,7 @@ const handlers = {
     );
   },
 
-  async draft_message({ chat, text }) {
+  async draft_message({ chat, text, group_link }) {
     if (!chat || !String(chat).trim()) throw new Error('`chat` is required.');
     const body = String(text || '').trim();
     if (!body) throw new Error('`text` is empty.');
@@ -1706,13 +1932,22 @@ const handlers = {
     if (draftQueue && draftQueue.status === 'active') {
       throw new Error('A draft queue is running: opening another draft would overwrite the one the user is about to send. Wait for it to finish or cancel it with draft_queue.');
     }
-    const recipient = await recipientFor(chat);
+    const recipient = await recipientFor(chat, { groupLink: group_link });
 
-    const blocked = checkSafeguards(recipient.phone, body);
+    const blocked = checkSafeguards(recipient.key, body);
     if (blocked) throw new Error(blocked);
 
-    await openDraft(recipient, body);
+    const { pasteFailure } = await openDraft(recipient, body);
 
+    if (recipient.kind === 'group') {
+      watchGroupLink(recipient.jid);
+      const where = `Opened WhatsApp on the group "${recipient.name}" through its invite link`;
+      const check = 'Have the user check that the group that opened is that one before sending.';
+      if (pasteFailure) {
+        return `${where}, but couldn't type the text in: ${pasteFailure}\nNothing was sent. ${check}`;
+      }
+      return `${where}, with the message typed in.\nNothing was sent: the user reviews it and presses Enter if it's right. ${check}`;
+    }
     const warning = recipient.known
       ? ''
       : '\n\n⚠️ You have never talked to this number. Check it is the right one before sending.';
@@ -1722,7 +1957,7 @@ const handlers = {
     );
   },
 
-  async send_message({ chat, text }) {
+  async send_message({ chat, text, group_link }) {
     const lim = loadLimits();
     if (!lim.allowSending) {
       throw new Error(
@@ -1738,17 +1973,21 @@ const handlers = {
       throw new Error('A draft queue is running: sending now would overwrite the draft the user is about to send.');
     }
 
-    const recipient = await recipientFor(chat);
-    const blocked = checkSafeguards(recipient.phone, body, { mode: 'send' });
+    const recipient = await recipientFor(chat, { groupLink: group_link, mode: 'send' });
+    const blocked = checkSafeguards(recipient.key, body, { mode: 'send' });
     if (blocked) throw new Error(blocked);
 
     const before = Date.now();
-    await openDraft(recipient, body, { send: true });
+    // strict: if the text couldn't be pasted into a group, don't press Enter on whatever is there
+    await openDraft(recipient, body, { send: true }, { strict: true });
     await sleep(1500);   // let WhatsApp open the chat and fill in the text
 
-    // A second Enter is safe: if the first one sent it, the box is empty and nothing goes out.
+    // A second Enter is safe in a one-to-one chat: if the first one sent it, the box is empty and
+    // nothing goes out. Not in a group: if its link stopped working, the first Enter may only have
+    // closed a notice, and a second one would land on whatever chat was open behind it.
+    const isGroup = recipient.kind === 'group';
     let sent = false;
-    for (let attempt = 1; attempt <= 2 && !sent; attempt += 1) {
+    for (let attempt = 1; attempt <= (isGroup ? 1 : 2) && !sent; attempt += 1) {
       await pressEnter();
       for (let i = 0; i < 12 && !sent; i += 1) {
         await sleep(500);
@@ -1757,6 +1996,14 @@ const handlers = {
     }
 
     const note = recipient.known ? '' : ' (a number you had never talked to)';
+    if (!sent && isGroup) {
+      unconfirmGroupLink(recipient.jid);
+      return (
+        `Couldn't confirm that the message to "${recipient.name}" went out: I pressed Enter but it didn't show up in that group. ` +
+        'Have the user look at WhatsApp: it may be typed and unsent, or the link may no longer open that group. Do NOT retry: ' +
+        'it could be sent twice. Direct sending to this group is off until a draft_message to it is sent and shows up there.'
+      );
+    }
     if (!sent) {
       return (
         `Couldn't confirm that the message to "${recipient.name}" went out: I pressed Enter but it didn't show up in WhatsApp. ` +
@@ -1817,9 +2064,9 @@ const handlers = {
       try {
         if (!text) throw new Error('empty text');
         if (text.length > lim.maxLength) throw new Error(`text has ${text.length} characters (max ${lim.maxLength})`);
-        const r = await recipientFor(m.chat);
-        if (seen.has(r.phone)) throw new Error(`same recipient as #${seen.get(r.phone)}`);
-        seen.set(r.phone, n + 1);
+        const r = await recipientFor(m.chat, { groupLink: m.group_link, mode: 'queue' });
+        if (seen.has(r.key)) throw new Error(`same recipient as #${seen.get(r.key)}`);
+        seen.set(r.key, n + 1);
         if (lim.antiBroadcast) {
           const same = items.find((i) => normalizeText(i.text) === normalizeText(text));
           if (same) throw new Error(`same text as the one for ${same.name} (anti-broadcast)`);
